@@ -1,0 +1,1 @@
+source "drivers/staging/remote_numa/ping_tests/Kconfig"
