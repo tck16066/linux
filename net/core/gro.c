@@ -5,6 +5,8 @@
 #include <trace/events/net.h>
 #include <linux/skbuff_ref.h>
 
+#include <linux/net_custom_hook.h>
+
 #define MAX_GRO_SKBS 8
 
 static DEFINE_SPINLOCK(offload_lock);
@@ -622,17 +624,25 @@ static gro_result_t napi_skb_finish(struct napi_struct *napi,
 
 gro_result_t napi_gro_receive(struct napi_struct *napi, struct sk_buff *skb)
 {
-	gro_result_t ret;
+        gro_result_t ret;
 
-	skb_mark_napi_id(skb, napi);
-	trace_napi_gro_receive_entry(skb);
+        // ---- CUSTOM HOOK: Early exit if handled ----
+        if (custom_net_hook && (custom_net_hook(skb) !=
+	    custom_net_hook_not_consumed)) {
+                // Packet consumed, don't process further
+                return 0;
+        }
+        // --------------------------------------------
 
-	skb_gro_reset_offset(skb, 0);
+        skb_mark_napi_id(skb, napi);
+        trace_napi_gro_receive_entry(skb);
 
-	ret = napi_skb_finish(napi, skb, dev_gro_receive(napi, skb));
-	trace_napi_gro_receive_exit(ret);
+        skb_gro_reset_offset(skb, 0);
 
-	return ret;
+        ret = napi_skb_finish(napi, skb, dev_gro_receive(napi, skb));
+        trace_napi_gro_receive_exit(ret);
+
+        return ret;
 }
 EXPORT_SYMBOL(napi_gro_receive);
 

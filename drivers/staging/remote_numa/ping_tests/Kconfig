@@ -1,0 +1,5 @@
+config REMOTE_NUMA
+    tristate "My Test Modules for remote numa"
+    default m
+    help
+        Experimental remote NUMA memory/test modules.
