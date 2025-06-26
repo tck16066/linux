@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-#include <net/gro.h>
-#include <net/dst_metadata.h>
-#include <net/busy_poll.h>
-#include <trace/events/net.h>
-#include <linux/skbuff_ref.h>
-
 #include <linux/net_custom_hook.h>
+#include <linux/skbuff_ref.h>
+#include <net/busy_poll.h>
+#include <net/dst_metadata.h>
+#include <net/gro.h>
+#include <trace/events/net.h>
 
 #define MAX_GRO_SKBS 8
 
@@ -626,13 +625,15 @@ gro_result_t napi_gro_receive(struct napi_struct *napi, struct sk_buff *skb)
 {
         gro_result_t ret;
 
-        // ---- CUSTOM HOOK: Early exit if handled ----
-        if (custom_net_hook && (custom_net_hook(skb) !=
-	    custom_net_hook_not_consumed)) {
-                // Packet consumed, don't process further
-                return 0;
+	rcu_read_lock();
+	custom_net_hook_ret_t (*func)(struct sk_buff *) = rcu_dereference(custom_net_hook);
+        if (func && (func(skb) != custom_net_hook_not_consumed)) {
+		// Packet consumed, don't process further
+		rcu_read_unlock();
+		return 0;
         }
-        // --------------------------------------------
+	rcu_read_unlock();
+
 
         skb_mark_napi_id(skb, napi);
         trace_napi_gro_receive_entry(skb);

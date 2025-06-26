@@ -8,6 +8,8 @@
 
 #ifndef _CUSTOM_NET_HOOK_H
 #define _CUSTOM_NET_HOOK_H
+
+#include <linux/rcupdate.h>
 #include <linux/skbuff.h>
 
 typedef enum custom_net_hook_ret
@@ -17,7 +19,7 @@ typedef enum custom_net_hook_ret
 	custom_net_hook_not_consumed,
 } custom_net_hook_ret_t;
 
-typedef custom_net_hook_ret_t (*custom_net_hook_fn_t)(struct sk_buff *skb);
+typedef custom_net_hook_ret_t (*__rcu custom_net_hook_fn_t)(struct sk_buff *skb);
 
 /*
  * Called inside napi_gro_receive() to give us a low-latency path to

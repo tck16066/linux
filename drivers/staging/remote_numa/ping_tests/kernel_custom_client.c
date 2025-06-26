@@ -9,7 +9,8 @@
 #include <linux/timekeeping.h>
 #include <linux/if_ether.h>
 #include <linux/string.h>
-#include <linux/net_custom_hook.h>	// your patch's header!
+#include <linux/net_custom_hook.h>
+#include <linux/rcupdate.h>
 
 #define ETH_P_CUSTOM 0x88B5
 #define PAYLOAD "KERNELPING"
@@ -115,13 +116,13 @@ raw_eth_client_init(void)
 	if (custom_net_hook)
 		printk(KERN_WARNING
 		       "raw_eth_client: handler already registered!\n");
-	custom_net_hook = my_custom_handler;
+	rcu_assign_pointer(custom_net_hook, my_custom_handler);
 	handler_registered = true;
 
 	kthread = kthread_run(client_thread, NULL, "raw_eth_client");
 	if (IS_ERR(kthread)) {
 		printk(KERN_ERR "raw_eth_client: kthread_run failed\n");
-		custom_net_hook = NULL;
+		rcu_assign_pointer(custom_net_hook, my_custom_handler);
 		handler_registered = false;
 		dev_put(dev);
 		return PTR_ERR(kthread);
@@ -138,7 +139,7 @@ raw_eth_client_exit(void)
 	if (kthread)
 		kthread_stop(kthread);
 	if (handler_registered)
-		custom_net_hook = NULL;
+		rcu_assign_pointer(custom_net_hook, my_custom_handler);
 	if (dev)
 		dev_put(dev);
 	printk(KERN_INFO "raw_eth_client: unloaded\n");

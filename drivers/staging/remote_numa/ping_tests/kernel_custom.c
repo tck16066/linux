@@ -5,6 +5,7 @@
 #include <linux/etherdevice.h>
 #include <linux/netdevice.h>
 #include <linux/net_custom_hook.h>
+#include <linux/rcupdate.h>
 
 #define MY_PROTO htons(0x88B5)
 
@@ -68,14 +69,14 @@ static int __init
 custom_eth_init(void)
 {
 	printk(KERN_INFO "Registering custom low-latency ethertype handler\n");
-	custom_net_hook = my_custom_handler;
+	rcu_assign_pointer(custom_net_hook, my_custom_handler);
 	return 0;
 }
 
 static void __exit
 custom_eth_exit(void)
 {
-	custom_net_hook = NULL;
+	rcu_assign_pointer(custom_net_hook, my_custom_handler);
 	printk(KERN_INFO "Unregistered custom handler\n");
 }
 
