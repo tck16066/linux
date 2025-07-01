@@ -22,26 +22,14 @@
 #include "eth_transport.h"
 #include "protocol.h"
 #include "transport.h"
+#include "worker_pool.h"
 
 #define REMOTE_NUMA_IF_NAME "eth0"
 #define REMOTE_NUMA_MAX_DATA_LEN 1500
 
-
-
-#define REMOTE_NUMA_SKB_SIZE(_size, _additional)				\
-	(sizeof(struct ethhdr) +						\
-	 (((_size + (_additional)) <					\
-	   (ETH_ZLEN - sizeof(struct ethhdr))) ?		\
-	  (ETH_ZLEN - sizeof(struct ethhdr)) :		\
-	  (_size + (_additional))) +					\
-	 NET_IP_ALIGN)
-
-#define REMOTE_NUMA_SKB_SIZE_FOR_TYPE(_T_, __additional)				\
-	REMOTE_NUMA_SKB_SIZE(sizeof(_T_), __additional)
-
-#define REMOTE_NUMA_ALLOC_TRPRT_CTX(ptr, type, err_label)			\
+#define REMOTE_NUMA_ALLOC_TRPRT_CTX(ptr, type, err_label, __mem)			\
 	do {								\
-		(ptr)->trprt_ctx = remote_numa_make_trprt_ctx();	\
+		(ptr)->trprt_ctx = remote_numa_make_trprt_ctx(__mem);	\
 		if (!(ptr)->trprt_ctx) {				\
 			printk(KERN_ERR					\
 			       "REMOTE_NUMA: alloc generic ctx failed\n"); \
@@ -80,11 +68,34 @@ typedef struct
 	u8 return_mac_addr[ETH_ALEN];
 } remote_numa_eth_priv_ret_info_t;
 
-static void* setup_skb(struct sk_buff *txskb, size_t data_len)
+static void free_rx_buff(void *buff)
+{
+	struct sk_buff *b = buff;
+	kfree_skb(b);
+}
+
+static custom_net_hook_ret_t eth_skb_handler(struct sk_buff *skb)
+{
+	if (skb->protocol != REMOTE_NUMA_ETHERTYPE)
+		return custom_net_hook_not_consumed;
+
+	if (remote_numa_submit_frame(skb)) {
+		free_rx_buff(skb);
+		return custom_net_hook_consumed_with_error;
+	}
+
+	return custom_net_hook_consumed;
+}
+
+static void* setup_skb(struct sk_buff *txskb, size_t payload_len)
 {
 	skb_reserve(txskb, NET_IP_ALIGN + sizeof(struct ethhdr));
-	data_len = data_len < ETH_ZLEN ? ETH_ZLEN : data_len;
-	void *data  = skb_put(txskb, data_len);
+
+	// Ethernet requires minimum 46-byte payload
+	size_t padded_len = payload_len < 46 ? 46 : payload_len;
+
+	void *data = skb_put(txskb, padded_len);
+
 	skb_push(txskb, sizeof(struct ethhdr));
 	skb_reset_mac_header(txskb);
 
@@ -93,9 +104,10 @@ static void* setup_skb(struct sk_buff *txskb, size_t data_len)
 
 static void alloc_tx_buffer(size_t payload_len, void **obj, void**payload_start)
 {
-	struct sk_buff *txskb = alloc_skb(
-	    REMOTE_NUMA_SKB_SIZE(payload_len, 0),
-	    GFP_ATOMIC);
+	size_t alloc_len = (sizeof(struct ethhdr) + ((payload_len <
+		(ETH_ZLEN - sizeof(struct ethhdr))) ? (ETH_ZLEN - sizeof(struct ethhdr)) :
+		 (payload_len))) + NET_IP_ALIGN;
+	struct sk_buff *txskb = alloc_skb(alloc_len, GFP_KERNEL);
 
 	if (!txskb)
 	{
@@ -103,8 +115,7 @@ static void alloc_tx_buffer(size_t payload_len, void **obj, void**payload_start)
 		*payload_start = NULL;
 		return;
 	}
-	*payload_start = setup_skb(txskb,
-		REMOTE_NUMA_SKB_SIZE(payload_len, 0));
+	*payload_start = setup_skb(txskb, payload_len);
 	*obj = txskb;
 }
 
@@ -113,7 +124,6 @@ static void* eth_priv_return_info(remote_numa_advert_t *advert)
 	remote_numa_eth_advert_t *eth_ad = (remote_numa_eth_advert_t*)advert;
 	remote_numa_eth_priv_ret_info_t *info =
 		kmalloc(sizeof(*info), GFP_KERNEL);
-
 	if (info)
 	{
 		ether_addr_copy(info->return_mac_addr, eth_ad->src_mac_addr);
@@ -135,12 +145,11 @@ void remote_numa_clean_donor_trprt_if(remote_numa_donor_trprt_if_t *iface)
 	if (!iface)
 		return;
 
+	if (iface->trprt_ctx->trprt_ctx)
+		kfree(iface->trprt_ctx->trprt_ctx);
+
 	if (iface->trprt_ctx)
-	{
-		kfree(iface->trprt_ctx);
-	}
-	remote_numa_transport_ctx_destroy(iface->trprt_ctx);
-	
+		remote_numa_transport_ctx_destroy(iface->trprt_ctx);
 }
 
 void remote_numa_clean_main_trprt_if(remote_numa_main_trprt_if_t *iface)
@@ -154,11 +163,11 @@ void remote_numa_clean_main_trprt_if(remote_numa_main_trprt_if_t *iface)
 	if (!iface)
 		return;
 
+	if (iface->trprt_ctx->trprt_ctx)
+		kfree(iface->trprt_ctx->trprt_ctx);
+
 	if (iface->trprt_ctx)
-	{
-		kfree(iface->trprt_ctx);
-	}
-	remote_numa_transport_ctx_destroy(iface->trprt_ctx);
+		remote_numa_transport_ctx_destroy(iface->trprt_ctx);
 }
 
 static u32 advert_to_node_id(remote_numa_advert_t *ad)
@@ -227,6 +236,17 @@ static remote_numa_send_ret_t tx_msg(remote_numa_trprt_ctx_t *trprt_ctx,
 	return send_msg(trprt_ctx->trprt_ctx, msg, return_info);
 }
 
+static void prepare_rx_buff(void *rx_buff, void **payload)
+{
+
+	struct sk_buff *skb = rx_buff;
+	u8 *pay = skb_mac_header_was_set(skb) ?
+		skb_mac_header(skb) + ETH_HLEN :
+		skb->data + ETH_HLEN;
+
+	*payload = pay;
+}
+
 static remote_numa_send_ret_t remote_numa_eth_tx_advert(remote_numa_trprt_ctx_t *trprt_ctx)
 {
 	/* The error path should not unlock if we did not
@@ -234,18 +254,19 @@ static remote_numa_send_ret_t remote_numa_eth_tx_advert(remote_numa_trprt_ctx_t 
  	 */
 	bool took_rcu = false;
 	remote_numa_send_ret_t ret = 0;
-	struct sk_buff *txskb = alloc_skb(
-	    REMOTE_NUMA_SKB_SIZE_FOR_TYPE(remote_numa_eth_advert_t, 0),
-	    GFP_ATOMIC);
+	struct sk_buff *txskb = NULL;
+	remote_numa_eth_advert_t *payload_start = NULL;
+	void **v_txskb = (void**)&txskb;
+	void **v_payload_start = (void**)&payload_start;
+
+	alloc_tx_buffer(sizeof(*payload_start), v_txskb, v_payload_start);
+	
 	if (!txskb)
 	{
 		ret = REMOTE_NUMA_TRPRT_RET(remote_numa_send_bad_alloc, 1);
 		goto done;
 	}
 	
-	remote_numa_eth_advert_t *payload_start =
-	    setup_skb(txskb,
-	        REMOTE_NUMA_SKB_SIZE_FOR_TYPE(remote_numa_eth_advert_t, 0));
 	payload_start->generic_advert.max_frame_len =
 	    ((struct remote_numa_eth_trprt_ctx *)trprt_ctx->trprt_ctx)->max_data_len;
 	
@@ -282,7 +303,6 @@ done:
 static remote_numa_receive_ret_t remote_numa_eth_rx_mem_query
     (remote_numa_trprt_ctx_t *trprt_ctx, remote_numa_mem_query_t *query)
 {
-	printk("rx a mem query");
 	return REMOTE_NUMA_TRPRT_RET(remote_numa_receive_err_unknown, 0);
 }
 
@@ -298,7 +318,7 @@ static remote_numa_receive_ret_t remote_numa_eth_rx_mem_resp
 	return REMOTE_NUMA_TRPRT_RET(remote_numa_receive_err_unknown, 0);
 }
 
-remote_numa_donor_trprt_if_t *remote_numa_eth_donor_init(skb_handler_t handler)
+remote_numa_donor_trprt_if_t *remote_numa_eth_donor_init(remote_numa_mem_mgr_t *mem)
 {
 	get_random_bytes(&net_secret, sizeof(net_secret));
 
@@ -309,17 +329,20 @@ remote_numa_donor_trprt_if_t *remote_numa_eth_donor_init(skb_handler_t handler)
 		goto err;
 	}
 
+	ptr->prepare_rx_buff = prepare_rx_buff;
+	ptr->free_rx_buff = free_rx_buff;
 	ptr->tx_advert = remote_numa_eth_tx_advert;
 	ptr->rx_mem_query = remote_numa_eth_rx_mem_query;
 	ptr->tx_mem_resp = remote_numa_eth_tx_mem_resp;
 
-	REMOTE_NUMA_ALLOC_TRPRT_CTX(ptr, struct remote_numa_eth_trprt_ctx, err);
+	REMOTE_NUMA_ALLOC_TRPRT_CTX(ptr,
+		struct remote_numa_eth_trprt_ctx, err, mem);
 	struct remote_numa_eth_trprt_ctx *eth_ctx = ptr->trprt_ctx->trprt_ctx;
 	eth_ctx->if_name = REMOTE_NUMA_IF_NAME;
 	eth_ctx->max_data_len =
 		REMOTE_NUMA_MAX_DATA_LEN - sizeof(remote_numa_msg_hdr_t);
 
-	rcu_assign_pointer(custom_net_hook, handler);
+	rcu_assign_pointer(custom_net_hook, eth_skb_handler);
 
 	return ptr;
 err:
@@ -328,7 +351,7 @@ err:
 	return NULL;
 }
 
-remote_numa_main_trprt_if_t *remote_numa_eth_main_init(skb_handler_t handler)
+remote_numa_main_trprt_if_t *remote_numa_eth_main_init(void)
 {
 	remote_numa_main_trprt_if_t *ptr = kzalloc(sizeof(*ptr), GFP_KERNEL);
 	if (!ptr)
@@ -337,6 +360,8 @@ remote_numa_main_trprt_if_t *remote_numa_eth_main_init(skb_handler_t handler)
 		goto err;
 	}
 
+	ptr->prepare_rx_buff = prepare_rx_buff;
+	ptr->free_rx_buff = free_rx_buff;
 	ptr->alloc_tx_buffer = alloc_tx_buffer;
 	ptr->remote_numa_node_id = advert_to_node_id;
 	ptr->priv_return_info = eth_priv_return_info;
@@ -344,13 +369,14 @@ remote_numa_main_trprt_if_t *remote_numa_eth_main_init(skb_handler_t handler)
 	ptr->rx_mem_resp = remote_numa_eth_rx_mem_resp;
 	ptr->tx_msg = tx_msg;
 
-	REMOTE_NUMA_ALLOC_TRPRT_CTX(ptr, struct remote_numa_eth_trprt_ctx ,err);
+	REMOTE_NUMA_ALLOC_TRPRT_CTX(ptr,
+		struct remote_numa_eth_trprt_ctx, err, NULL);
 	struct remote_numa_eth_trprt_ctx *eth_ctx = ptr->trprt_ctx->trprt_ctx;
 	eth_ctx->if_name = REMOTE_NUMA_IF_NAME;
 	eth_ctx->max_data_len =
 		REMOTE_NUMA_MAX_DATA_LEN - sizeof(remote_numa_msg_hdr_t);
 
-	rcu_assign_pointer(custom_net_hook, handler);
+	rcu_assign_pointer(custom_net_hook, eth_skb_handler);
 
 	return ptr;
 err:

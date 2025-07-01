@@ -10,6 +10,7 @@
 
 #include <linux/skbuff.h>
 
+#include "memory.h"
 #include "protocol.h"
 #include "transport.h"
 
@@ -17,10 +18,10 @@
 
 typedef custom_net_hook_ret_t (*skb_handler_t)(struct sk_buff *);
 
-remote_numa_donor_trprt_if_t *remote_numa_eth_donor_init(skb_handler_t handler);
+remote_numa_donor_trprt_if_t *remote_numa_eth_donor_init(remote_numa_mem_mgr_t *mem);
 void remote_numa_clean_donor_trprt_if(remote_numa_donor_trprt_if_t *iface);
 
-remote_numa_main_trprt_if_t *remote_numa_eth_main_init(skb_handler_t handler);
+remote_numa_main_trprt_if_t *remote_numa_eth_main_init(void );
 void remote_numa_clean_main_trprt_if(remote_numa_main_trprt_if_t *iface);
 
 #endif

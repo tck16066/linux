@@ -14,7 +14,7 @@
 
 #define REMOTE_NUMA_SUPPORTED_PROTO  remote_numa_protocol_0_1
 
-remote_numa_trprt_ctx_t *remote_numa_make_trprt_ctx(void)
+remote_numa_trprt_ctx_t *remote_numa_make_trprt_ctx(remote_numa_mem_mgr_t *mem)
 {
 	remote_numa_trprt_ctx_t *ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx)
@@ -24,6 +24,7 @@ remote_numa_trprt_ctx_t *remote_numa_make_trprt_ctx(void)
 
 	spin_lock_init(&ctx->hash_write_lock);
 
+	ctx->mem = mem;
 	ctx->trprt_ctx = NULL;
 	return ctx;
 }
@@ -46,39 +47,55 @@ void remote_numa_transport_ctx_destroy(remote_numa_trprt_ctx_t *ctx)
 }
 
 remote_numa_receive_ret_t remote_numa_main_rx(
-	remote_numa_main_trprt_if_t *main_if, void *rx_data)
+	remote_numa_main_trprt_if_t *main_if, void *rx_data, void *payload)
 {
-	remote_numa_msg_hdr_t *hdr = rx_data;
+	remote_numa_receive_ret_t ret = 0;
+
+	remote_numa_msg_hdr_t *hdr = payload;
 	if (hdr->version != REMOTE_NUMA_SUPPORTED_PROTO)
 	{
-		return REMOTE_NUMA_TRPRT_RET(remote_numa_receive_bad_proto, 1);
+		ret = REMOTE_NUMA_TRPRT_RET(remote_numa_receive_bad_proto, 1);
+		goto done;
 	}
 
 	switch(hdr->type)
 	{
 	case remote_numa_eth_advert:
-		return remote_numa_rx_advert(main_if, rx_data);
+		ret = remote_numa_rx_advert(main_if, payload);
+		goto done;
 	default:
-		return REMOTE_NUMA_TRPRT_RET(remote_numa_receive_mangled_pkt, 1);
+		ret = REMOTE_NUMA_TRPRT_RET(remote_numa_receive_mangled_pkt, 1);
+		goto done;
 	}
+done:
+	main_if->free_rx_buff(rx_data);	
+	return ret;
 }
 
 remote_numa_receive_ret_t remote_numa_donor_rx(
-	remote_numa_donor_trprt_if_t *donor_if, void *rx_data)
+	remote_numa_donor_trprt_if_t *donor_if, void *rx_data, void *payload)
 {
-	remote_numa_msg_hdr_t *hdr = rx_data;
+	remote_numa_receive_ret_t ret = 0;
+
+	remote_numa_msg_hdr_t *hdr = payload;
 	if (hdr->version != REMOTE_NUMA_SUPPORTED_PROTO)
 	{
-		return REMOTE_NUMA_TRPRT_RET(remote_numa_receive_bad_proto, 1);
+		ret = REMOTE_NUMA_TRPRT_RET(remote_numa_receive_bad_proto, 1);
+		goto done;
 	}
 
 	switch(hdr->type)
 	{
 	case remote_numa_mem_query:
-		return remote_numa_rx_mem_query(donor_if, rx_data);
+		ret = remote_numa_rx_mem_query(donor_if, rx_data);
+		goto done;
 	default:
-		return REMOTE_NUMA_TRPRT_RET(remote_numa_receive_mangled_pkt, 1);
+		ret = REMOTE_NUMA_TRPRT_RET(remote_numa_receive_mangled_pkt, 1);
+		goto done;
 	}
+done:
+	donor_if->free_rx_buff(rx_data);	
+	return ret;
 }
 
 remote_numa_receive_ret_t remote_numa_rx_advert(
@@ -107,7 +124,7 @@ remote_numa_receive_ret_t remote_numa_rx_advert(
 		goto success;
 	}
 
-	node = kmalloc(sizeof(*node), GFP_ATOMIC);
+	node = kmalloc(sizeof(*node), GFP_KERNEL);
 
 	if (!node)
 		return REMOTE_NUMA_TRPRT_RET(remote_numa_receive_bad_alloc, 1);
