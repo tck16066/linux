@@ -11,6 +11,7 @@
 #include <linux/hashtable.h>
 #include <linux/types.h>
 
+#include "memory.h"
 #include "protocol.h"
 
 /* Create a return val for base + transport */
@@ -71,6 +72,7 @@ typedef struct
 
 typedef struct
 {
+	remote_numa_mem_mgr_t *mem;
 	DECLARE_HASHTABLE(node_table, REMOTE_NUMA_HASH_TABLE_ORDER);
 	void *trprt_ctx;
 	spinlock_t hash_write_lock;
@@ -78,6 +80,8 @@ typedef struct
 
 typedef struct
 {
+	void (*free_rx_buff)(void *);
+	void (*prepare_rx_buff)(void *rx_buff, void **payload);
 	remote_numa_send_ret_t (*tx_advert)(remote_numa_trprt_ctx_t *trprt_ctx);
 	remote_numa_receive_ret_t (*rx_mem_query)(remote_numa_trprt_ctx_t *trprt_ctx, remote_numa_mem_query_t *query);
 	remote_numa_send_ret_t (*tx_mem_resp)(remote_numa_trprt_ctx_t *trprt_ctx, remote_numa_mem_resp_t *resp);
@@ -91,6 +95,8 @@ typedef struct
 	u32 (*remote_numa_node_id)(remote_numa_advert_t *);
 	void* (*priv_return_info)(remote_numa_advert_t *);
 	void (*free_priv_return_info)(void*);
+	void (*free_rx_buff)(void *);
+	void (*prepare_rx_buff)(void *rx_buff, void **payload);
 	void (*alloc_tx_buffer)(size_t payload_len,
 		void **obj, void**payload_start);
 	remote_numa_send_ret_t (*tx_msg)(remote_numa_trprt_ctx_t *trprt_ctx,
@@ -101,15 +107,15 @@ typedef struct
 	remote_numa_trprt_ctx_t *trprt_ctx;
 } remote_numa_main_trprt_if_t;
 
-remote_numa_trprt_ctx_t *remote_numa_make_trprt_ctx(void);
+remote_numa_trprt_ctx_t *remote_numa_make_trprt_ctx(remote_numa_mem_mgr_t *mem);
 
 void remote_numa_transport_ctx_destroy(remote_numa_trprt_ctx_t *ctx);
 
 remote_numa_receive_ret_t remote_numa_main_rx(
-	remote_numa_main_trprt_if_t *main_if, void *rx_data);
+	remote_numa_main_trprt_if_t *main_if, void *rx_data, void *payload);
 
 remote_numa_receive_ret_t remote_numa_donor_rx(
-	remote_numa_donor_trprt_if_t *donor_if, void *rx_data);
+	remote_numa_donor_trprt_if_t *donor_if, void *rx_data, void *payload);
 
 remote_numa_receive_ret_t remote_numa_rx_advert(
 	remote_numa_main_trprt_if_t *main_if,
