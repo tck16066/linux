@@ -59,12 +59,6 @@ struct remote_numa_eth_trprt_ctx
 
 typedef struct
 {
-	remote_numa_advert_t generic_advert;
-	u8 src_mac_addr[ETH_ALEN];
-}  __attribute__((__packed__)) remote_numa_eth_advert_t;
-
-typedef struct
-{
 	u8 return_mac_addr[ETH_ALEN];
 } remote_numa_eth_priv_ret_info_t;
 
@@ -119,14 +113,40 @@ static void alloc_tx_buffer(size_t payload_len, void **obj, void**payload_start)
 	*obj = txskb;
 }
 
-static void* eth_priv_return_info(remote_numa_advert_t *advert)
+static remote_numa_send_ret_t eth_priv_return_info(
+	void *trprt_ctx,
+	remote_numa_main_return_info_t *info)
 {
-	remote_numa_eth_advert_t *eth_ad = (remote_numa_eth_advert_t*)advert;
+	struct remote_numa_eth_trprt_ctx *eth_ctx = trprt_ctx;
+	struct net_device *dev = dev_get_by_name_rcu(&init_net, eth_ctx->if_name);
+	if (!dev)
+	{
+		return REMOTE_NUMA_TRPRT_RET(remote_numa_send_no_if, 3);
+	}
+	ether_addr_copy(info->abstract_info, dev->dev_addr);
+
+	return 0;
+}
+
+static void* eth_priv_return_info_from_advert(remote_numa_advert_t *advert)
+{
 	remote_numa_eth_priv_ret_info_t *info =
 		kmalloc(sizeof(*info), GFP_KERNEL);
 	if (info)
 	{
-		ether_addr_copy(info->return_mac_addr, eth_ad->src_mac_addr);
+		ether_addr_copy(info->return_mac_addr,
+			advert->return_info.abstract_info);
+	}
+	return info;
+}
+
+static void* eth_priv_return_info_from_mem_query(remote_numa_mem_query_t *mem)
+{
+	remote_numa_eth_priv_ret_info_t *info =
+		kmalloc(sizeof(*info), GFP_KERNEL);
+	if (info)
+	{
+		ether_addr_copy(info->return_mac_addr, mem->return_info.abstract_info);
 	}
 	return info;
 }
@@ -176,8 +196,13 @@ static u32 advert_to_node_id(remote_numa_advert_t *ad)
  	 * Cast is ok because we know that this advert type is only sent by this
  	 * transport type (or we would once we got an auth model working!).
  	 */
-	remote_numa_eth_advert_t* eth = (remote_numa_eth_advert_t*)ad;
-	return hsiphash(eth->src_mac_addr,
+	return hsiphash(ad->return_info.abstract_info,
+		ETH_ALEN, (const hsiphash_key_t *) &net_secret);
+}
+
+static u32 mem_query_to_node_id(remote_numa_mem_query_t *mem)
+{
+	return hsiphash(mem->return_info.abstract_info,
 		ETH_ALEN, (const hsiphash_key_t *) &net_secret);
 }
 
@@ -255,7 +280,7 @@ static remote_numa_send_ret_t remote_numa_eth_tx_advert(remote_numa_trprt_ctx_t 
 	bool took_rcu = false;
 	remote_numa_send_ret_t ret = 0;
 	struct sk_buff *txskb = NULL;
-	remote_numa_eth_advert_t *payload_start = NULL;
+	remote_numa_advert_t *payload_start = NULL;
 	void **v_txskb = (void**)&txskb;
 	void **v_payload_start = (void**)&payload_start;
 
@@ -267,13 +292,14 @@ static remote_numa_send_ret_t remote_numa_eth_tx_advert(remote_numa_trprt_ctx_t 
 		goto done;
 	}
 	
-	payload_start->generic_advert.max_frame_len =
+	payload_start->max_frame_len =
 	    ((struct remote_numa_eth_trprt_ctx *)trprt_ctx->trprt_ctx)->max_data_len;
 	
-	remote_numa_msg_hdr_t *hdr = &payload_start->generic_advert.hdr;
+	remote_numa_msg_hdr_t *hdr = &payload_start->hdr;
 	hdr->version = remote_numa_eth_advert;
 	hdr->type = remote_numa_protocol_0_1;
-	hdr->sender_cookie = 0;
+	hdr->main_cookie = 0;
+	hdr->donor_cookie = 0;
 
 	if (!rcu_read_lock_held())
 	{
@@ -289,7 +315,7 @@ static remote_numa_send_ret_t remote_numa_eth_tx_advert(remote_numa_trprt_ctx_t 
 		ret = REMOTE_NUMA_TRPRT_RET(remote_numa_send_no_if, 2);
 		goto done;
 	}
-	ether_addr_copy(payload_start->src_mac_addr, dev->dev_addr);
+	ether_addr_copy(payload_start->return_info.abstract_info, dev->dev_addr);
 
 	ret = send_msg(
 		trprt_ctx->trprt_ctx, txskb, REMOTE_NUMA_SERVICE_MAC);
@@ -329,11 +355,15 @@ remote_numa_donor_trprt_if_t *remote_numa_eth_donor_init(remote_numa_mem_mgr_t *
 		goto err;
 	}
 
+	ptr->priv_return_info_from_mem_query = eth_priv_return_info_from_mem_query;
+	ptr->remote_numa_node_id = mem_query_to_node_id;
+	ptr->alloc_tx_buffer = alloc_tx_buffer;
 	ptr->prepare_rx_buff = prepare_rx_buff;
 	ptr->free_rx_buff = free_rx_buff;
 	ptr->tx_advert = remote_numa_eth_tx_advert;
 	ptr->rx_mem_query = remote_numa_eth_rx_mem_query;
 	ptr->tx_mem_resp = remote_numa_eth_tx_mem_resp;
+	ptr->tx_msg = tx_msg;
 
 	REMOTE_NUMA_ALLOC_TRPRT_CTX(ptr,
 		struct remote_numa_eth_trprt_ctx, err, mem);
@@ -365,6 +395,7 @@ remote_numa_main_trprt_if_t *remote_numa_eth_main_init(void)
 	ptr->alloc_tx_buffer = alloc_tx_buffer;
 	ptr->remote_numa_node_id = advert_to_node_id;
 	ptr->priv_return_info = eth_priv_return_info;
+	ptr->priv_return_info_from_advert = eth_priv_return_info_from_advert;
 	ptr->free_priv_return_info = eth_free_priv_return_info;
 	ptr->rx_mem_resp = remote_numa_eth_rx_mem_resp;
 	ptr->tx_msg = tx_msg;

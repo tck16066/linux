@@ -54,18 +54,14 @@ typedef enum
 	remote_numa_receive_bad_alloc = 2,
 	remote_numa_receive_bad_proto = 3,
 	remote_numa_receive_mangled_pkt = 4,
+	remote_numa_receive_bad_cookie = 4,
 	/*After 255, they are transport-encoded.*/
 	remote_numa_receive_max = 255,
 } remote_numa_receive_ret_t;
 
 typedef struct
 {
-	u32                          node_id;
-        /* Used to resolve hash collisions on packet rx. We assume that a
- 	 * collision can happen in cases of mixed transport type (ethernet,
- 	 * USB, etc.), but most likely not inside a single transport type.
- 	 */
-	enum   remote_numa_msg_type  advert_type;
+	u32			     node_id;
 	struct hlist_node            hnode;
 	void *priv_return_info;
 } remote_numa_node_t;
@@ -80,8 +76,14 @@ typedef struct
 
 typedef struct
 {
+	u32 (*remote_numa_node_id)(remote_numa_mem_query_t *);
 	void (*free_rx_buff)(void *);
 	void (*prepare_rx_buff)(void *rx_buff, void **payload);
+	void (*alloc_tx_buffer)(size_t payload_len,
+		void **obj, void**payload_start);
+	void* (*priv_return_info_from_mem_query)(remote_numa_mem_query_t *);
+	remote_numa_send_ret_t (*tx_msg)(remote_numa_trprt_ctx_t *trprt_ctx,
+		void *return_info, void *msg);
 	remote_numa_send_ret_t (*tx_advert)(remote_numa_trprt_ctx_t *trprt_ctx);
 	remote_numa_receive_ret_t (*rx_mem_query)(remote_numa_trprt_ctx_t *trprt_ctx, remote_numa_mem_query_t *query);
 	remote_numa_send_ret_t (*tx_mem_resp)(remote_numa_trprt_ctx_t *trprt_ctx, remote_numa_mem_resp_t *resp);
@@ -93,7 +95,9 @@ typedef struct
 typedef struct
 {
 	u32 (*remote_numa_node_id)(remote_numa_advert_t *);
-	void* (*priv_return_info)(remote_numa_advert_t *);
+	remote_numa_send_ret_t (*priv_return_info)(
+		void *trprt_ctx, remote_numa_main_return_info_t *info);
+	void* (*priv_return_info_from_advert)(remote_numa_advert_t *);
 	void (*free_priv_return_info)(void*);
 	void (*free_rx_buff)(void *);
 	void (*prepare_rx_buff)(void *rx_buff, void **payload);
@@ -124,6 +128,10 @@ remote_numa_receive_ret_t remote_numa_rx_advert(
 remote_numa_receive_ret_t remote_numa_rx_mem_query(
 	remote_numa_donor_trprt_if_t *donor_if,
 	remote_numa_mem_query_t *query);
+
+remote_numa_receive_ret_t remote_numa_rx_mem_resp(
+	remote_numa_main_trprt_if_t *main_if,
+	remote_numa_mem_resp_t *resp);
 
 #endif
 
