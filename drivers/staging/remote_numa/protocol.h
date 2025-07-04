@@ -29,8 +29,14 @@ typedef struct {
 	u8   version : 6;
 	u16  type : 10;
 	u16  reserved;
-	u32  sender_cookie;
+	u32  main_cookie;
+	u32  donor_cookie;
 } __attribute__((__packed__)) remote_numa_msg_hdr_t;
+
+typedef struct
+{
+	u8 abstract_info[16];
+} __attribute__((__packed__)) remote_numa_main_return_info_t;
 
 /*
  * Used to advertise remote numa node of agnostic transport type.
@@ -38,6 +44,7 @@ typedef struct {
 typedef struct
 {
 	remote_numa_msg_hdr_t hdr;
+	remote_numa_main_return_info_t return_info;
 	/* Refers to data only, not transport overhead. */
 	u16                   max_frame_len;
 } __attribute__((__packed__)) remote_numa_advert_t;
@@ -45,7 +52,7 @@ typedef struct
 typedef struct
 {
 	remote_numa_msg_hdr_t hdr;
-	
+	remote_numa_main_return_info_t return_info;
 } __attribute__((__packed__)) remote_numa_mem_query_t;
 
 typedef struct
@@ -54,7 +61,7 @@ typedef struct
 	u8                    total_pages_rank;
 	u8                    page_size_rank;
 	u16                   reserved;
-	u64                   free_pages;
+	u32                   free_pages;
 } __attribute__((__packed__)) remote_numa_mem_resp_t;
 
 #endif

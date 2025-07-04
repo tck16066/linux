@@ -5,6 +5,8 @@
 * Copyright (C) 2025 Trevor Kemp
 */
 
+#include <linux/mm.h>
+#include <linux/rculist.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/spinlock_types.h>
@@ -13,6 +15,25 @@
 #include "transport.h"
 
 #define REMOTE_NUMA_SUPPORTED_PROTO  remote_numa_protocol_0_1
+
+static remote_numa_node_t *
+__remote_numa_get_or_add_node(
+	remote_numa_trprt_ctx_t *context,
+	unsigned int table_bits,
+	spinlock_t *lock,
+	u32 node_id,
+	void *(*make_priv_return_info)(void *type),
+	void *type);
+
+static remote_numa_node_t *
+	__remote_numa_get_node(struct hlist_head *table,
+		       unsigned int table_bits,
+		       u32 node_id);
+
+static remote_numa_node_t *
+	__remote_numa_get_node_locking(struct hlist_head *table,
+			       unsigned int table_bits,
+			       u32 node_id);
 
 remote_numa_trprt_ctx_t *remote_numa_make_trprt_ctx(remote_numa_mem_mgr_t *mem)
 {
@@ -63,6 +84,9 @@ remote_numa_receive_ret_t remote_numa_main_rx(
 	case remote_numa_eth_advert:
 		ret = remote_numa_rx_advert(main_if, payload);
 		goto done;
+	case remote_numa_mem_resp:
+		ret = remote_numa_rx_mem_resp(main_if, payload);
+		goto done;
 	default:
 		ret = REMOTE_NUMA_TRPRT_RET(remote_numa_receive_mangled_pkt, 1);
 		goto done;
@@ -87,7 +111,7 @@ remote_numa_receive_ret_t remote_numa_donor_rx(
 	switch(hdr->type)
 	{
 	case remote_numa_mem_query:
-		ret = remote_numa_rx_mem_query(donor_if, rx_data);
+		ret = remote_numa_rx_mem_query(donor_if, payload);
 		goto done;
 	default:
 		ret = REMOTE_NUMA_TRPRT_RET(remote_numa_receive_mangled_pkt, 1);
@@ -102,73 +126,18 @@ remote_numa_receive_ret_t remote_numa_rx_advert(
 	remote_numa_main_trprt_if_t *main_if,
 	remote_numa_advert_t *advert)
 {
-	remote_numa_node_t *iter_node;
-	bool present_already = false;
-	rcu_read_lock();
 	u32 node_id = main_if->remote_numa_node_id(advert);
-	hash_for_each_possible_rcu(main_if->trprt_ctx->node_table,
-				    iter_node, hnode, node_id)
-	{
-		if (iter_node->node_id == node_id && iter_node->advert_type == advert->hdr.type)
-		{
-			present_already = true;
-			break;
-		}
-	}
-	rcu_read_unlock();
-
-	remote_numa_node_t *node;
-	if (present_already)
-	{
-		node = iter_node;
-		goto success;
-	}
-
-	node = kmalloc(sizeof(*node), GFP_KERNEL);
+	remote_numa_node_t *node = __remote_numa_get_or_add_node(
+		main_if->trprt_ctx,
+		REMOTE_NUMA_HASH_TABLE_ORDER,
+		&main_if->trprt_ctx->hash_write_lock,
+		node_id,
+		(void *(*)(void *))main_if->priv_return_info_from_advert,
+		advert);
 
 	if (!node)
-		return REMOTE_NUMA_TRPRT_RET(remote_numa_receive_bad_alloc, 1);
-	node->advert_type = advert->hdr.type;
-	node->node_id = node_id;
-
-	unsigned long flags;
-	spin_lock_irqsave(&main_if->trprt_ctx->hash_write_lock, flags);
-
-	// Need to check again if anyone has added this node.
-	present_already = false;
-	hash_for_each_possible_rcu(main_if->trprt_ctx->node_table,
-				    iter_node, hnode, node_id)
-	{
-		if (iter_node->node_id == node_id && iter_node->advert_type == advert->hdr.type)
-		{
-			present_already = true;
-			break;
-		}
-	}
-
-	if (!present_already)
-	{
-		node->priv_return_info = main_if->priv_return_info(advert);
-		if (!node->priv_return_info)
-		{
-			kfree(node);
-			spin_unlock_irqrestore(
-				&main_if->trprt_ctx->hash_write_lock, flags);
-			return REMOTE_NUMA_TRPRT_RET(
-				remote_numa_receive_bad_alloc, 2);
-		}
-		hash_add_rcu(main_if->trprt_ctx->node_table,
-				&node->hnode, node->node_id);
-	}
-	else
-	{
-		kfree(node);
-		node = iter_node;
-	}
-
-	spin_unlock_irqrestore(&main_if->trprt_ctx->hash_write_lock, flags);
-
-success:
+		return REMOTE_NUMA_TRPRT_RET(remote_numa_receive_bad_alloc, 5);
+		
 	void *tx_buffer_start;
 	remote_numa_mem_query_t *query;
 	void **v_query = (void **)&query;
@@ -181,7 +150,11 @@ success:
 	}
 	query->hdr.version = remote_numa_protocol_0_1;
 	query->hdr.type = remote_numa_mem_query;
-	query->hdr.sender_cookie = node->node_id;
+	query->hdr.main_cookie = node_id;
+	query->hdr.donor_cookie = 0;
+	/* XXX need a way to handle this return code */
+	main_if->priv_return_info(main_if->trprt_ctx->trprt_ctx,
+		&query->return_info);
 	
 	return main_if->tx_msg(main_if->trprt_ctx,
 		node->priv_return_info, tx_buffer_start) == 0 ?
@@ -192,7 +165,129 @@ remote_numa_receive_ret_t remote_numa_rx_mem_query(
 	remote_numa_donor_trprt_if_t *donor_if,
 	remote_numa_mem_query_t *query)
 {
-	// TODO replace this, remove from the specializatoin.
-	return donor_if->rx_mem_query(donor_if->trprt_ctx->trprt_ctx, query);
+	u32 node_id = query->hdr.donor_cookie ?
+		query->hdr.donor_cookie : donor_if->remote_numa_node_id(query);
+	remote_numa_node_t *node = __remote_numa_get_or_add_node(
+		donor_if->trprt_ctx,
+		REMOTE_NUMA_HASH_TABLE_ORDER,
+		&donor_if->trprt_ctx->hash_write_lock,
+		node_id,
+		(void *(*)(void *))donor_if->priv_return_info_from_mem_query,
+		query);
+
+	if (!node)
+		return REMOTE_NUMA_TRPRT_RET(remote_numa_receive_bad_alloc, 6);
+
+	void *tx_buffer_start;
+	remote_numa_mem_resp_t *resp;
+	void **v_resp = (void **)&resp;
+	donor_if->alloc_tx_buffer(sizeof(remote_numa_mem_resp_t),
+		&tx_buffer_start, v_resp);
+	if (tx_buffer_start == NULL || resp == NULL)
+	{
+		// TODO make file id for each return code to use.
+		return REMOTE_NUMA_TRPRT_RET(remote_numa_send_bad_alloc, 2);
+	}
+	resp->hdr.version = remote_numa_protocol_0_1;
+	resp->hdr.type = remote_numa_mem_resp;
+	resp->hdr.main_cookie = query->hdr.main_cookie;
+	resp->hdr.donor_cookie = node_id;
+
+	// TODO XXX this should be under rcu lock
+
+	resp->total_pages_rank = donor_if->trprt_ctx->mem->num_pages_rank;
+	resp->page_size_rank =
+		donor_if->trprt_ctx->mem->page_size_rank;
+	resp->free_pages = donor_if->trprt_ctx->mem->free_pages;
+
+	return donor_if->tx_msg(donor_if->trprt_ctx,
+		node->priv_return_info, tx_buffer_start) == 0 ?
+		0 : REMOTE_NUMA_TRPRT_RET(remote_numa_receive_err_unknown, 2);
+}
+
+
+remote_numa_receive_ret_t remote_numa_rx_mem_resp(
+	remote_numa_main_trprt_if_t *main_if,
+	remote_numa_mem_resp_t *resp)
+{
+	remote_numa_node_t *node = __remote_numa_get_node_locking(main_if->trprt_ctx->node_table,
+		REMOTE_NUMA_HASH_TABLE_ORDER, resp->hdr.main_cookie); 
+	printk("MEM RESP %d %d %d", resp->total_pages_rank, resp->page_size_rank, resp->free_pages);
+
+	return 0;
+}
+
+static remote_numa_node_t *
+__remote_numa_get_or_add_node(
+	remote_numa_trprt_ctx_t *context,
+	unsigned int table_bits,
+	spinlock_t *lock,
+	u32 node_id,
+	void *(*make_priv_return_info)(void *type),
+	void *type)
+{
+
+	remote_numa_node_t *iter_node;
+
+	rcu_read_lock();
+	hash_for_each_possible_rcu(context->node_table, iter_node, hnode, node_id) {
+		if (iter_node->node_id == node_id) {
+			rcu_read_unlock();
+			return iter_node;
+		}
+	}
+	rcu_read_unlock();
+
+	remote_numa_node_t *node = kzalloc(sizeof(*node), GFP_KERNEL);
+	if (!node)
+		return NULL;
+
+	node->node_id = node_id;
+	node->priv_return_info = make_priv_return_info(type);
+
+	spin_lock(lock);
+	hash_for_each_possible_rcu(context->node_table, iter_node, hnode, node_id) {
+		if (iter_node->node_id == node_id) {
+			spin_unlock(lock);
+			kfree(node);
+			return iter_node;
+		}
+	}
+
+	hash_add_rcu(context->node_table, &node->hnode, node_id);
+	spin_unlock(lock);
+
+	return node;
+}
+
+
+/* Pure lookup: caller must hold rcu_read_lock() */
+static remote_numa_node_t *
+__remote_numa_get_node(struct hlist_head *table,
+		       unsigned int table_bits,
+		       u32 node_id)
+{
+	remote_numa_node_t *node;
+	struct hlist_head *head = &table[hash_min(node_id, table_bits)];
+
+	hlist_for_each_entry_rcu(node, head, hnode, head) {
+		if (node->node_id == node_id)
+			return node;
+	}
+	return NULL;
+}
+
+static remote_numa_node_t *
+__remote_numa_get_node_locking(struct hlist_head *table,
+			       unsigned int table_bits,
+			       u32 node_id)
+{
+	remote_numa_node_t *node;
+
+	rcu_read_lock();
+	node = __remote_numa_get_node(table, table_bits, node_id);
+	rcu_read_unlock();
+
+	return node;
 }
 
