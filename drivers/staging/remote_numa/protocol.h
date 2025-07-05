@@ -99,7 +99,7 @@ typedef struct
 {
 	remote_numa_msg_hdr_t hdr;
 	u16 request_id;
-	u8 reserved;
+	u16 reserved;
 	u16 pg_num;
 	u16 max_seq_num;
 } __attribute__((__packed__)) remote_numa_mem_pg_xfer_ack_t;
