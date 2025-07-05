@@ -24,7 +24,7 @@
 #define ADVERT_RANDOM_SLEEP_MS_MAX 500
 #define WORKER_POOL_SIZE 4
 
-#define NUM_PGS_RANK 18
+#define REMOTE_NUMA_NUM_PGS 262144
 
 static struct task_struct *kthread = NULL;
 static remote_numa_donor_trprt_if_t *ctx = NULL;
@@ -53,7 +53,7 @@ advert_thread(void *data)
 static int __init
 remote_numa_donor_node_init(void)
 {
-	mem = remote_numa_create_mem_mgr(NUM_PGS_RANK);
+	mem = remote_numa_create_mem_mgr(REMOTE_NUMA_NUM_PGS);
 	if (!mem)
 		return -ENOMEM;
 	remote_numa_worker_pool_init(rx_wrapper, WORKER_POOL_SIZE);

@@ -18,6 +18,12 @@ enum remote_numa_msg_type
 
 	remote_numa_mem_query = 20,
 	remote_numa_mem_resp,
+	remote_numa_mem_alloc,
+	remote_numa_mem_satisfaction,
+	remote_numa_mem_sat_ack,
+	remote_numa_mem_sync,
+	remote_numa_mem_free,
+	remote_numa_mem_free_ack,
 };
 
 enum remote_numa_protocol_version
@@ -58,10 +64,58 @@ typedef struct
 typedef struct
 {
 	remote_numa_msg_hdr_t hdr;
-	u8                    total_pages_rank;
 	u8                    page_size_rank;
-	u16                   reserved;
+	u32                   reserved : 24;
 	u32                   free_pages;
 } __attribute__((__packed__)) remote_numa_mem_resp_t;
 
+typedef struct
+{
+	remote_numa_msg_hdr_t hdr;
+	u16 request_id;
+	u8 num_pages;
+	u8 reserved;
+	
+} __attribute__((__packed__)) remote_numa_mem_alloc_t;
+
+typedef enum
+{
+	remote_numa_xfer_done = 1,
+	remote_numa_xfer_end_of_pg = 2,
+} remote_numa_mem_pg_xfer_flags_t;
+
+typedef struct
+{
+	remote_numa_msg_hdr_t hdr;
+	u16 request_id;
+	u8  flags;
+	u8  reserved;
+	u16 pg_num;
+	u16 seq_num;
+	u32 donor_pg_cookie;
+} __attribute__((__packed__)) remote_numa_mem_pg_xfer_t;
+
+typedef struct
+{
+	remote_numa_msg_hdr_t hdr;
+	u16 request_id;
+	u8 reserved;
+	u16 pg_num;
+	u16 max_seq_num;
+} __attribute__((__packed__)) remote_numa_mem_pg_xfer_ack_t;
+
+typedef struct
+{
+	remote_numa_msg_hdr_t hdr;
+	u16 request_id;
+	u16 pg_num;
+	u32 donor_pg_cookie;
+} __attribute__((__packed__)) remote_numa_mem_free_t;
+
+typedef struct
+{
+	remote_numa_msg_hdr_t hdr;
+	u16 request_id;
+	u16 pg_num;
+} __attribute__((__packed__)) remote_numa_mem_free_ack_t;
 #endif

@@ -192,10 +192,6 @@ void remote_numa_clean_main_trprt_if(remote_numa_main_trprt_if_t *iface)
 
 static u32 advert_to_node_id(remote_numa_advert_t *ad)
 {
-	/*
- 	 * Cast is ok because we know that this advert type is only sent by this
- 	 * transport type (or we would once we got an auth model working!).
- 	 */
 	return hsiphash(ad->return_info.abstract_info,
 		ETH_ALEN, (const hsiphash_key_t *) &net_secret);
 }

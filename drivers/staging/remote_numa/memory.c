@@ -52,14 +52,14 @@ static void clean_pool(mem_pool_t *pool)
 	kfree(pool);
 }
 
-remote_numa_mem_mgr_t *remote_numa_create_mem_mgr(size_t num_pages_rank)
+remote_numa_mem_mgr_t *remote_numa_create_mem_mgr(size_t num_pages)
 {
 	remote_numa_mem_mgr_t *mgr = kmalloc(sizeof(*mgr), GFP_KERNEL);
 	if (!mgr)
 		goto err;
 
-	mgr->num_pools = (1 << num_pages_rank) / REMOTE_NUMA_POOL_SIZE;
-	mgr->num_pools = mgr->num_pools == 0 ? 1 : mgr->num_pools;
+	mgr->num_pools = num_pages / REMOTE_NUMA_POOL_SIZE;
+	mgr->num_pools += num_pages % REMOTE_NUMA_POOL_SIZE == 0 ? 0  : 1;
 	mgr->priv = kzalloc(sizeof(mem_pool_t*) * mgr->num_pools, GFP_KERNEL);
 	if (!mgr->priv)
 		goto err;
@@ -72,8 +72,7 @@ remote_numa_mem_mgr_t *remote_numa_create_mem_mgr(size_t num_pages_rank)
 			goto err;
 	}
 
-	mgr->num_pages_rank = num_pages_rank;
-	mgr->free_pages = 1 << num_pages_rank;
+	mgr->free_pages = num_pages;
 	mgr->page_size_rank = PAGE_SHIFT;
 
 	return mgr;

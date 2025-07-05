@@ -195,7 +195,6 @@ remote_numa_receive_ret_t remote_numa_rx_mem_query(
 
 	// TODO XXX this should be under rcu lock
 
-	resp->total_pages_rank = donor_if->trprt_ctx->mem->num_pages_rank;
 	resp->page_size_rank =
 		donor_if->trprt_ctx->mem->page_size_rank;
 	resp->free_pages = donor_if->trprt_ctx->mem->free_pages;
@@ -210,9 +209,7 @@ remote_numa_receive_ret_t remote_numa_rx_mem_resp(
 	remote_numa_main_trprt_if_t *main_if,
 	remote_numa_mem_resp_t *resp)
 {
-	remote_numa_node_t *node = __remote_numa_get_node_locking(main_if->trprt_ctx->node_table,
-		REMOTE_NUMA_HASH_TABLE_ORDER, resp->hdr.main_cookie); 
-	printk("MEM RESP %d %d %d", resp->total_pages_rank, resp->page_size_rank, resp->free_pages);
+	printk("MEM RESP %d %d",  resp->page_size_rank, resp->free_pages);
 
 	return 0;
 }
@@ -291,3 +288,38 @@ __remote_numa_get_node_locking(struct hlist_head *table,
 	return node;
 }
 
+remote_numa_receive_ret_t remote_numa_rx_mem_alloc(
+	remote_numa_donor_trprt_if_t *donor_if,
+	remote_numa_mem_alloc_t *alloc)
+{
+	return 1;
+}
+
+remote_numa_receive_ret_t remote_numa_rx_mem_pg_alloc_xfer(
+	remote_numa_donor_trprt_if_t *donor_if,
+	remote_numa_mem_pg_xfer_t *xfer)
+{
+	return 1;
+}
+
+remote_numa_receive_ret_t remote_numa_rx_mem_pg_sync_xfer(
+	remote_numa_main_trprt_if_t *main_if,
+	remote_numa_mem_pg_xfer_t *xfer)
+{
+	return 1;
+}
+
+remote_numa_receive_ret_t remote_numa_rx_mem_pg_free(
+	remote_numa_main_trprt_if_t *main_if,
+	remote_numa_mem_free_t *pg_free)
+{
+	return 1;
+}
+
+
+remote_numa_receive_ret_t remote_numa_rx_mem_pg_free_ack(
+	remote_numa_main_trprt_if_t *main_if,
+	remote_numa_mem_free_ack_t *ack)
+{
+	return 1;
+}
