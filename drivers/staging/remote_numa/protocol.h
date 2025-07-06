@@ -22,6 +22,7 @@ enum remote_numa_msg_type
 	remote_numa_mem_satisfaction,
 	remote_numa_mem_sat_ack,
 	remote_numa_mem_sync,
+	remote_numa_mem_sync_ack,
 	remote_numa_mem_free,
 	remote_numa_mem_free_ack,
 };
@@ -92,7 +93,7 @@ typedef struct
 	u8  reserved;
 	u16 pg_num;
 	u16 seq_num;
-	u32 donor_pg_cookie;
+	u32 sender_pg_cookie;
 } __attribute__((__packed__)) remote_numa_mem_pg_xfer_t;
 
 typedef struct
@@ -102,6 +103,8 @@ typedef struct
 	u16 reserved;
 	u16 pg_num;
 	u16 max_seq_num;
+	u32 sender_pg_cookie;
+	u32 receiver_pg_cookie;
 } __attribute__((__packed__)) remote_numa_mem_pg_xfer_ack_t;
 
 typedef struct

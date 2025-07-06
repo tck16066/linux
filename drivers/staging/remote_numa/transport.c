@@ -87,6 +87,15 @@ remote_numa_receive_ret_t remote_numa_main_rx(
 	case remote_numa_mem_resp:
 		ret = remote_numa_rx_mem_resp(main_if, payload);
 		goto done;
+	case remote_numa_mem_satisfaction:
+		ret = remote_numa_rx_mem_pg_alloc_xfer(main_if, payload);
+		goto done;
+	case remote_numa_mem_sync_ack:
+		ret = remote_numa_rx_mem_pg_sync_ack(main_if, payload);
+		goto done;
+	case remote_numa_mem_free_ack:
+		ret = remote_numa_rx_mem_pg_free_ack(main_if, payload);
+		goto done;
 	default:
 		ret = REMOTE_NUMA_TRPRT_RET(remote_numa_receive_mangled_pkt, 1);
 		goto done;
@@ -112,6 +121,18 @@ remote_numa_receive_ret_t remote_numa_donor_rx(
 	{
 	case remote_numa_mem_query:
 		ret = remote_numa_rx_mem_query(donor_if, payload);
+		goto done;
+	case remote_numa_mem_alloc:
+		ret = remote_numa_rx_mem_alloc(donor_if, payload);
+		goto done;
+	case remote_numa_mem_sat_ack:
+		ret = remote_numa_rx_mem_pg_sat_ack(donor_if, payload);
+		goto done;
+	case remote_numa_mem_sync:
+		ret = remote_numa_rx_mem_pg_sync_xfer(donor_if, payload);
+		goto done;
+	case remote_numa_mem_free:
+		ret = remote_numa_rx_mem_pg_free(donor_if, payload);
 		goto done;
 	default:
 		ret = REMOTE_NUMA_TRPRT_RET(remote_numa_receive_mangled_pkt, 1);
@@ -296,21 +317,35 @@ remote_numa_receive_ret_t remote_numa_rx_mem_alloc(
 }
 
 remote_numa_receive_ret_t remote_numa_rx_mem_pg_alloc_xfer(
-	remote_numa_donor_trprt_if_t *donor_if,
+	remote_numa_main_trprt_if_t *main_if,
 	remote_numa_mem_pg_xfer_t *xfer)
 {
 	return 1;
 }
 
 remote_numa_receive_ret_t remote_numa_rx_mem_pg_sync_xfer(
-	remote_numa_main_trprt_if_t *main_if,
+	remote_numa_donor_trprt_if_t *donor_if,
 	remote_numa_mem_pg_xfer_t *xfer)
 {
 	return 1;
 }
 
-remote_numa_receive_ret_t remote_numa_rx_mem_pg_free(
+remote_numa_receive_ret_t remote_numa_rx_mem_pg_sat_ack(
+	remote_numa_donor_trprt_if_t *donor_if,
+	remote_numa_mem_pg_xfer_ack_t *xfer)
+{
+	return 1;
+}
+
+remote_numa_receive_ret_t remote_numa_rx_mem_pg_sync_ack(
 	remote_numa_main_trprt_if_t *main_if,
+	remote_numa_mem_pg_xfer_ack_t *xfer)
+{
+	return 1;
+}
+
+remote_numa_receive_ret_t remote_numa_rx_mem_pg_free(
+	remote_numa_donor_trprt_if_t *donor_if,
 	remote_numa_mem_free_t *pg_free)
 {
 	return 1;

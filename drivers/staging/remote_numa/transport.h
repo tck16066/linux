@@ -138,15 +138,23 @@ remote_numa_receive_ret_t remote_numa_rx_mem_alloc(
 	remote_numa_mem_alloc_t *alloc);
 
 remote_numa_receive_ret_t remote_numa_rx_mem_pg_alloc_xfer(
+	remote_numa_main_trprt_if_t *main_if,
+	remote_numa_mem_pg_xfer_t *xfer);
+
+remote_numa_receive_ret_t remote_numa_rx_mem_pg_sat_ack(
+	remote_numa_donor_trprt_if_t *donor_if,
+	remote_numa_mem_pg_xfer_ack_t *xfer);
+
+remote_numa_receive_ret_t remote_numa_rx_mem_pg_sync_xfer(
 	remote_numa_donor_trprt_if_t *donor_if,
 	remote_numa_mem_pg_xfer_t *xfer);
 
-remote_numa_receive_ret_t remote_numa_rx_mem_pg_sync_xfer(
+remote_numa_receive_ret_t remote_numa_rx_mem_pg_sync_ack(
 	remote_numa_main_trprt_if_t *main_if,
-	remote_numa_mem_pg_xfer_t *xfer);
+	remote_numa_mem_pg_xfer_ack_t *xfer);
 
 remote_numa_receive_ret_t remote_numa_rx_mem_pg_free(
-	remote_numa_main_trprt_if_t *main_if,
+	remote_numa_donor_trprt_if_t *donor_if,
 	remote_numa_mem_free_t *pg_free);
 
 remote_numa_receive_ret_t remote_numa_rx_mem_pg_free_ack(
