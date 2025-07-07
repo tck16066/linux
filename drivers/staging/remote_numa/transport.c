@@ -323,6 +323,25 @@ remote_numa_receive_ret_t remote_numa_rx_mem_pg_alloc_xfer(
 	return 1;
 }
 
+remote_numa_send_ret_t remote_numa_transport_alloc_page(
+	remote_numa_main_trprt_if_t *trprt,
+	u32 donor_node_id,
+	struct page *target,
+	void *completion_ctx)
+{
+	return 1;
+}
+
+remote_numa_send_ret_t remote_numa_transport_refetch_page(
+	remote_numa_main_trprt_if_t *trprt,
+	u32 donor_node_id,
+	u32 donor_pg_cookie,
+	struct page *target,
+	void *completion_ctx)
+{
+	return 1;
+}
+
 remote_numa_receive_ret_t remote_numa_rx_mem_pg_sync_xfer(
 	remote_numa_donor_trprt_if_t *donor_if,
 	remote_numa_mem_pg_xfer_t *xfer)

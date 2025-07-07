@@ -19,6 +19,7 @@ enum remote_numa_msg_type
 	remote_numa_mem_query = 20,
 	remote_numa_mem_resp,
 	remote_numa_mem_alloc,
+	remote_numa_mem_refetch,
 	remote_numa_mem_satisfaction,
 	remote_numa_mem_sat_ack,
 	remote_numa_mem_sync,
