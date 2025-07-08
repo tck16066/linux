@@ -12,6 +12,7 @@
 #include <linux/spinlock.h>
 #include <linux/wait.h>
 #include <linux/mm.h>
+#include <linux/types.h>
 #include "protocol.h"
 #include "transport.h"
 
@@ -19,7 +20,7 @@ typedef struct {
 	struct page *page;
 	u32 donor_node_id;
 	u32 donor_pg_cookie;
-	u32 main_pg_cookie;
+	u64 main_pg_cookie;
 	struct list_head lru_list;
 } remote_numa_cached_page_t;
 
@@ -45,3 +46,4 @@ int remote_numa_client_cache_refault(remote_numa_client_cache_t *cache,
 				     struct page *faulting_page);
 
 #endif
+
