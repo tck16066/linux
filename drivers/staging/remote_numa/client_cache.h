@@ -18,14 +18,14 @@
 
 typedef struct {
 	struct page *page;
-	u32 donor_node_id;
-	u32 donor_pg_cookie;
+	u64 donor_pg_cookie;
 	u64 main_pg_cookie;
 	struct list_head lru_list;
 } remote_numa_cached_page_t;
 
 typedef struct {
 	struct list_head lru_head;
+	struct list_head free_list;
 	spinlock_t lock;
 	wait_queue_head_t waitq;
 	u32 max_cached_pages;
@@ -39,9 +39,12 @@ int remote_numa_client_cache_init(remote_numa_client_cache_t *cache,
 
 void remote_numa_client_cache_destroy(remote_numa_client_cache_t *cache);
 
-struct page *remote_numa_client_cache_alloc(remote_numa_client_cache_t *cache,
-					    u32 donor_node_id);
+struct page *remote_numa_client_cache_alloc(remote_numa_client_cache_t *cache);
 
+/*
+ * Refaults a previously evicted remote page.
+ * Uses a (mm, addr) → donor_pg_cookie mapping to retrieve content from donor.
+ */
 int remote_numa_client_cache_refault(remote_numa_client_cache_t *cache,
 				     struct page *faulting_page);
 
