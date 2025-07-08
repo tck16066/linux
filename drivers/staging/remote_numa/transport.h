@@ -138,7 +138,7 @@ remote_numa_receive_ret_t remote_numa_rx_mem_alloc(
 	remote_numa_donor_trprt_if_t *donor_if,
 	remote_numa_mem_alloc_t *alloc);
 
-remote_numa_send_ret_t remote_numa_transport_alloc_page(
+remote_numa_send_ret_t remote_numa_transport_alloc_page_rcu(
 	remote_numa_main_trprt_if_t *trprt,
 	remote_numa_node_t *donor,
 	struct page *target,

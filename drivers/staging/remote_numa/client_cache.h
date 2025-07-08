@@ -19,7 +19,6 @@
 typedef struct {
 	struct page *page;
 	u64 donor_pg_cookie;
-	u64 main_pg_cookie;
 	struct list_head lru_list;
 } remote_numa_cached_page_t;
 

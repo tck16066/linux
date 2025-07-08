@@ -10,8 +10,6 @@
 /* assumes lock is held */
 static remote_numa_node_t choose_donor(remote_numa_client_cache_t *cache)
 {
-	u64 donor_pg_cookie = 0;
-
 	remote_numa_node_t *node;
 	int bkt;
 
@@ -157,7 +155,6 @@ int remote_numa_client_cache_init(remote_numa_client_cache_t *cache,
 			return -ENOMEM;
 		}
 		entry->page = page;
-		entry->main_pg_cookie = (u64)(uintptr_t)page;
 		entry->donor_pg_cookie = 0;
 
 		list_add(&entry->lru_list, &cache->free_list);
@@ -250,7 +247,6 @@ int remote_numa_client_cache_refault(remote_numa_client_cache_t *cache,
 		return -ENOMEM;
 
 	entry->page = faulting_page;
-	entry->main_pg_cookie = (u64)(uintptr_t)faulting_page;
 	entry->donor_pg_cookie = donor_pg_cookie;
 
 	if (remote_numa_transport_refetch_page(cache->trprt,
