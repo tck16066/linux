@@ -158,7 +158,6 @@ remote_numa_receive_ret_t remote_numa_rx_advert(
 
 	if (!node)
 		return REMOTE_NUMA_TRPRT_RET(remote_numa_receive_bad_alloc, 5);
-		
 	void *tx_buffer_start;
 	remote_numa_mem_query_t *query;
 	void **v_query = (void **)&query;
@@ -176,7 +175,10 @@ remote_numa_receive_ret_t remote_numa_rx_advert(
 	/* XXX need a way to handle this return code */
 	main_if->priv_return_info(main_if->trprt_ctx->trprt_ctx,
 		&query->return_info);
-	
+	/* 
+ 	 * N.B., we are not accessing anything here that would be written
+ 	 * after init, so we do not lock the node.
+ 	 */	
 	return main_if->tx_msg(main_if->trprt_ctx,
 		node->priv_return_info, tx_buffer_start) == 0 ?
 		0 : REMOTE_NUMA_TRPRT_RET(remote_numa_receive_err_unknown, 1);
@@ -220,17 +222,27 @@ remote_numa_receive_ret_t remote_numa_rx_mem_query(
 		donor_if->trprt_ctx->mem->page_size_rank;
 	resp->free_pages = donor_if->trprt_ctx->mem->free_pages;
 
+	/* 
+ 	 * N.B., we are not accessing anything here that would be written
+ 	 * after init, so we do not lock the node.
+ 	 */	
 	return donor_if->tx_msg(donor_if->trprt_ctx,
 		node->priv_return_info, tx_buffer_start) == 0 ?
 		0 : REMOTE_NUMA_TRPRT_RET(remote_numa_receive_err_unknown, 2);
 }
 
-
 remote_numa_receive_ret_t remote_numa_rx_mem_resp(
 	remote_numa_main_trprt_if_t *main_if,
 	remote_numa_mem_resp_t *resp)
 {
-	printk("MEM RESP %d %d",  resp->page_size_rank, resp->free_pages);
+	remote_numa_node_t *node = __remote_numa_get_node_locking(
+		main_if->trprt_ctx->node_table,
+		REMOTE_NUMA_HASH_TABLE_ORDER, resp->hdr.main_cookie);
+	spin_lock(&node->node_lock);
+	node->free_pages = resp->free_pages;
+	node->page_size_rank = resp->page_size_rank;
+	node->valid_mem_resp = true;
+	spin_unlock(&node->node_lock);
 
 	return 0;
 }
@@ -260,6 +272,7 @@ __remote_numa_get_or_add_node(
 	if (!node)
 		return NULL;
 
+	spin_lock_init(&node->node_lock);
 	node->node_id = node_id;
 	node->priv_return_info = make_priv_return_info(type);
 
@@ -335,7 +348,7 @@ remote_numa_send_ret_t remote_numa_transport_alloc_page_rcu(
 remote_numa_send_ret_t remote_numa_transport_refetch_page(
 	remote_numa_main_trprt_if_t *trprt,
 	u32 donor_node_id,
-	u32 donor_pg_cookie,
+	u64 donor_pg_cookie,
 	struct page *target,
 	void *completion_ctx)
 {
@@ -374,6 +387,15 @@ remote_numa_receive_ret_t remote_numa_rx_mem_pg_free(
 remote_numa_receive_ret_t remote_numa_rx_mem_pg_free_ack(
 	remote_numa_main_trprt_if_t *main_if,
 	remote_numa_mem_free_ack_t *ack)
+{
+	return 1;
+}
+
+remote_numa_send_ret_t remote_numa_tx_mem_pg_sync_xfer(
+	remote_numa_main_trprt_if_t *main_if,
+	u64 donor_pg_cookie,
+	struct page * pg,
+	remote_numa_cached_page_t *victim)
 {
 	return 1;
 }

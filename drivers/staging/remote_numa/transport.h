@@ -12,6 +12,7 @@
 #include <linux/mm_types.h>
 #include <linux/types.h>
 
+#include "client_cache.h"
 #include "memory.h"
 #include "protocol.h"
 
@@ -28,6 +29,8 @@
 #define REMOTE_NUMA_TRPT_RET_TRPRT_CODE(code) ((code & ~0xFF) >> 8)
 
 #define REMOTE_NUMA_HASH_TABLE_ORDER 16
+
+struct remote_numa_cached_page;
 
 /*
  * Return status for sending messages. Transports encode their specific
@@ -65,6 +68,12 @@ typedef struct
 	u32			     node_id;
 	struct hlist_node            hnode;
 	void *priv_return_info;
+
+	u64 donor_pg_cookie;
+	u32 free_pages;
+	u8 page_size_rank;
+	bool valid_mem_resp;
+	spinlock_t node_lock;
 } remote_numa_node_t;
 
 typedef struct
@@ -75,7 +84,7 @@ typedef struct
 	spinlock_t hash_write_lock;
 } remote_numa_trprt_ctx_t;
 
-typedef struct
+typedef struct remote_numa_donor_trprt_if
 {
 	u32 (*remote_numa_node_id)(remote_numa_mem_query_t *);
 	void (*free_rx_buff)(void *);
@@ -93,7 +102,7 @@ typedef struct
 	remote_numa_trprt_ctx_t *trprt_ctx;
 } remote_numa_donor_trprt_if_t;
 
-typedef struct
+typedef struct remote_numa_main_trprt_if
 {
 	u32 (*remote_numa_node_id)(remote_numa_advert_t *);
 	remote_numa_send_ret_t (*priv_return_info)(
@@ -147,7 +156,7 @@ remote_numa_send_ret_t remote_numa_transport_alloc_page_rcu(
 remote_numa_send_ret_t remote_numa_transport_refetch_page(
 	remote_numa_main_trprt_if_t *trprt,
 	u32 donor_node_id,
-	u32 donor_pg_cookie,
+	u64 donor_pg_cookie,
 	struct page *target,
 	void *completion_ctx);
 
@@ -158,6 +167,12 @@ remote_numa_receive_ret_t remote_numa_rx_mem_pg_alloc_xfer(
 remote_numa_receive_ret_t remote_numa_rx_mem_pg_sat_ack(
 	remote_numa_donor_trprt_if_t *donor_if,
 	remote_numa_mem_pg_xfer_ack_t *xfer);
+
+remote_numa_send_ret_t remote_numa_tx_mem_pg_sync_xfer(
+	remote_numa_main_trprt_if_t *main_if,
+	u64 donor_pg_cookie,
+	struct page * pg,
+	struct remote_numa_cached_page *victim);
 
 remote_numa_receive_ret_t remote_numa_rx_mem_pg_sync_xfer(
 	remote_numa_donor_trprt_if_t *donor_if,

@@ -8,12 +8,12 @@
 #include "transport.h"
 
 /* assumes lock is held */
-static remote_numa_node_t choose_donor(remote_numa_client_cache_t *cache)
+static remote_numa_node_t *choose_donor(remote_numa_client_cache_t *cache)
 {
 	remote_numa_node_t *node;
 	int bkt;
 
-	hash_for_each(cache->trprt->node_table, bkt, node, hnode) {
+	hash_for_each(cache->trprt->trprt_ctx->node_table, bkt, node, hnode) {
 		if (node->valid_mem_resp && node->free_pages > 0) {
 			node->free_pages--;
 			break;
@@ -31,6 +31,7 @@ struct refault_entry {
 	struct mm_struct *mm;
 	unsigned long addr;
 	u64 donor_pg_cookie;
+	u32 donor_id;
 	struct hlist_node node;
 };
 
@@ -40,7 +41,7 @@ static u32 refault_hash_key(struct mm_struct *mm, unsigned long addr)
 }
 
 static void refault_table_insert(struct mm_struct *mm, unsigned long addr,
-				  u64 donor_pg_cookie)
+				  u64 donor_pg_cookie, u32 donor_id)
 {
 	struct refault_entry *entry = kmalloc(sizeof(*entry), GFP_KERNEL);
 	if (!entry)
@@ -48,19 +49,21 @@ static void refault_table_insert(struct mm_struct *mm, unsigned long addr,
 	entry->mm = mm;
 	entry->addr = addr;
 	entry->donor_pg_cookie = donor_pg_cookie;
+	entry->donor_id = donor_id;
 	hash_add(refault_table, &entry->node, refault_hash_key(mm, addr));
 }
 
-static u64 refault_table_lookup(struct mm_struct *mm, unsigned long addr)
+static struct refault_entry*
+refault_table_lookup(struct mm_struct *mm, unsigned long addr)
 {
 	struct refault_entry *entry;
 	u32 key = refault_hash_key(mm, addr);
 
 	hash_for_each_possible(refault_table, entry, node, key) {
 		if (entry->mm == mm && entry->addr == addr)
-			return entry->donor_pg_cookie;
+			return entry;
 	}
-	return 0;
+	return NULL;
 }
 
 static void refault_table_clear(void)
@@ -80,26 +83,28 @@ static int maybe_evict(remote_numa_client_cache_t *cache)
 	if (cache->current_cached_pages >= cache->max_cached_pages) {
 		remote_numa_cached_page_t *victim;
 
-		if (list_empty(&cache->lru_head)) {
+		if (list_empty(&cache->lru_head))
 			return -ENOMEM;
-		}
+
 		victim = list_last_entry(&cache->lru_head,
-					 remote_numa_cached_page_t, lru_list);
+			remote_numa_cached_page_t, lru_list);
 		list_del(&victim->lru_list);
 		cache->current_cached_pages--;
 
-		if (page_mapped(victim->page))
-			try_to_unmap(victim->page, TTU_UNMAP | TTU_IGNORE_MLOCK);
-
-		if (victim->page->mapping && victim->page->mapping->host) {
-			struct address_space *mapping = victim->page->mapping;
-			unsigned long addr = victim->page->index << PAGE_SHIFT;
-			struct mm_struct *mm = mapping->host->vm_mm;
-			if (mm)
-				refault_table_insert(mm, addr, victim->donor_pg_cookie);
+		if (victim->mm && victim->addr) {
+			struct vm_area_struct *vma;
+			down_read(&victim->mm->mmap_lock);
+			vma = find_vma(victim->mm, victim->addr);
+			if (vma && victim->addr >= vma->vm_start) {
+				zap_page_range_single(vma, victim->addr, PAGE_SIZE, NULL);
+				refault_table_insert(victim->mm, victim->addr,
+						     victim->donor_pg_cookie,
+						     victim->donor_id);
+			}
+			up_read(&victim->mm->mmap_lock);
 		}
 
-		remote_numa_transport_sync_page(cache->trprt,
+		remote_numa_tx_mem_pg_sync_xfer(cache->trprt,
 						victim->donor_pg_cookie,
 						victim->page,
 						victim);
@@ -183,7 +188,8 @@ void remote_numa_client_cache_destroy(remote_numa_client_cache_t *cache)
 	refault_table_clear();
 }
 
-struct page *remote_numa_client_cache_alloc(remote_numa_client_cache_t *cache)
+struct page *remote_numa_client_cache_alloc(remote_numa_client_cache_t *cache,
+	struct vm_fault *vmf)
 {
 	spin_lock(&cache->lock);
 	if (maybe_evict(cache))
@@ -194,8 +200,8 @@ struct page *remote_numa_client_cache_alloc(remote_numa_client_cache_t *cache)
 	if (!entry)
 		goto err;
 
-	/* XXX handle OOM on all donors.*/
-	bool need_rcu_unlock = !in_rcu();
+	/* XXX handle OOM on individual and all donors. Data race. */
+	bool need_rcu_unlock = !rcu_read_lock_held();
 	bool took_rcu_lock = false;
 	if (need_rcu_unlock)
 	{
@@ -203,13 +209,16 @@ struct page *remote_numa_client_cache_alloc(remote_numa_client_cache_t *cache)
 		took_rcu_lock = true;
 	}
 
-	remote_numa_node_t donor = choose_donor(cache);
+	remote_numa_node_t *donor = choose_donor(cache);
 
 	entry->donor_pg_cookie = 0;
+	entry->donor_id = donor->node_id;
+	entry->mm = vmf->vma->vm_mm;
+	entry->addr = vmf->address;
 
 	spin_unlock(&cache->lock);
 
-	if (remote_numa_transport_alloc_page(cache->trprt,
+	if (remote_numa_transport_alloc_page_rcu(cache->trprt,
 					     donor,
 					     entry->page, entry)) {
 		spin_lock(&cache->lock);
@@ -230,7 +239,8 @@ err:
 }
 
 int remote_numa_client_cache_refault(remote_numa_client_cache_t *cache,
-				     struct page *faulting_page)
+				     struct page *faulting_page,
+				     struct vm_fault *vmf)
 {
 	if (maybe_evict(cache))
 		return -ENOMEM;
@@ -239,7 +249,10 @@ int remote_numa_client_cache_refault(remote_numa_client_cache_t *cache,
 	unsigned long addr = (unsigned long)page_address(faulting_page);
 
 	spin_lock(&cache->lock);
-	u64 donor_pg_cookie = refault_table_lookup(mm, addr);
+	struct refault_entry *rentry = refault_table_lookup(mm, addr);
+	u64 donor_pg_cookie = rentry->donor_pg_cookie;
+	u32 donor_id = rentry->donor_id;
+
 	remote_numa_cached_page_t *entry = reuse_page(cache);
 	spin_unlock(&cache->lock);
 
@@ -248,11 +261,15 @@ int remote_numa_client_cache_refault(remote_numa_client_cache_t *cache,
 
 	entry->page = faulting_page;
 	entry->donor_pg_cookie = donor_pg_cookie;
+	entry->donor_id = donor_id;
+	entry->mm = vmf->vma->vm_mm;
+	entry->addr = vmf->address;
 
 	if (remote_numa_transport_refetch_page(cache->trprt,
+						donor_id,
 						donor_pg_cookie,
 						faulting_page,
-						entry)) {
+						NULL)) { // XXX NULL
 		spin_lock(&cache->lock);
 		list_add(&entry->lru_list, &cache->free_list);
 		spin_unlock(&cache->lock);
