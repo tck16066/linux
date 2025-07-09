@@ -11,6 +11,7 @@
 #include <linux/hashtable.h>
 #include <linux/mm_types.h>
 #include <linux/types.h>
+#include <linux/wait.h>
 
 #include "client_cache.h"
 #include "memory.h"
@@ -157,8 +158,7 @@ remote_numa_send_ret_t remote_numa_transport_refetch_page(
 	remote_numa_main_trprt_if_t *trprt,
 	u32 donor_node_id,
 	u64 donor_pg_cookie,
-	struct page *target,
-	void *completion_ctx);
+	struct page *target);
 
 remote_numa_receive_ret_t remote_numa_rx_mem_pg_alloc_xfer(
 	remote_numa_main_trprt_if_t *main_if,

@@ -142,7 +142,6 @@ int remote_numa_client_cache_init(remote_numa_client_cache_t *cache,
 	INIT_LIST_HEAD(&cache->lru_head);
 	INIT_LIST_HEAD(&cache->free_list);
 	spin_lock_init(&cache->lock);
-	init_waitqueue_head(&cache->waitq);
 	cache->max_cached_pages = max_cached_pages;
 	cache->current_cached_pages = 0;
 	cache->trprt = trprt;
@@ -268,8 +267,7 @@ int remote_numa_client_cache_refault(remote_numa_client_cache_t *cache,
 	if (remote_numa_transport_refetch_page(cache->trprt,
 						donor_id,
 						donor_pg_cookie,
-						faulting_page,
-						NULL)) { // XXX NULL
+						faulting_page)) { // XXX NULL
 		spin_lock(&cache->lock);
 		list_add(&entry->lru_list, &cache->free_list);
 		spin_unlock(&cache->lock);
