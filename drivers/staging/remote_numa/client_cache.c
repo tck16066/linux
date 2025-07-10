@@ -219,7 +219,7 @@ struct page *remote_numa_client_cache_alloc(remote_numa_client_cache_t *cache,
 
 	if (remote_numa_transport_alloc_page_rcu(cache->trprt,
 					     donor,
-					     entry->page, entry)) {
+					     entry->page)) {
 		spin_lock(&cache->lock);
 		list_add(&entry->lru_list, &cache->free_list);
 		goto err;

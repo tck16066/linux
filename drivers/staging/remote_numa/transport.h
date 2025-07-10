@@ -151,8 +151,7 @@ remote_numa_receive_ret_t remote_numa_rx_mem_alloc(
 remote_numa_send_ret_t remote_numa_transport_alloc_page_rcu(
 	remote_numa_main_trprt_if_t *trprt,
 	remote_numa_node_t *donor,
-	struct page *target,
-	void *completion_ctx);
+	struct page *target);
 
 remote_numa_send_ret_t remote_numa_transport_refetch_page(
 	remote_numa_main_trprt_if_t *trprt,
