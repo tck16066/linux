@@ -32,6 +32,7 @@
 #define REMOTE_NUMA_HASH_TABLE_ORDER 16
 
 struct remote_numa_cached_page;
+struct remote_numa_client_cache;
 
 /*
  * Return status for sending messages. Transports encode their specific
@@ -120,6 +121,7 @@ typedef struct remote_numa_main_trprt_if
 
 	/* Some callbacks need transport-specific data. */
 	remote_numa_trprt_ctx_t *trprt_ctx;
+	struct remote_numa_client_cache *client_cache;
 } remote_numa_main_trprt_if_t;
 
 remote_numa_trprt_ctx_t *remote_numa_make_trprt_ctx(remote_numa_mem_mgr_t *mem);

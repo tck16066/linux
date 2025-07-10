@@ -14,13 +14,16 @@
 #include <linux/skbuff.h>
 #include <linux/types.h>
 
+#include "client_cache.h"
 #include "eth_transport.h"
 #include "protocol.h"
 #include "worker_pool.h"
 
 #define WORKER_POOL_SIZE 4
+#define REMOTE_NUMA_MAX_CACHED_PGS 128000
 
 remote_numa_main_trprt_if_t *ctx = NULL;
+remote_numa_client_cache_t *client_cache = NULL;
 
 static remote_numa_receive_ret_t rx_wrapper(void *frame)
 {
@@ -39,15 +42,35 @@ remote_numa_main_node_init(void)
 		printk(KERN_ERR "REMOTE_NUMA main bad init.");
 		return -ENOMEM;
 	}
+	client_cache = kzalloc(sizeof(*client_cache), GFP_KERNEL);
+	if (!client_cache)
+	{
+		printk(KERN_ERR "Could not alloc client cache.");
+		return -ENOMEM;
+	}
+
+	int cache_init = -1;
+	if ((cache_init = remote_numa_client_cache_init(
+		client_cache,
+		ctx,
+		REMOTE_NUMA_MAX_CACHED_PGS)))
+	{
+		printk(KERN_ERR "Could not init client cache.");
+		return cache_init;
+	}
+	ctx->client_cache = client_cache;
 	return 0;
 }
 
 static void __exit
 remote_numa_main_node_exit(void)
 {
+	/* Once any pages have been allocated, this is essentially
+ 	 * never safe to call*/
 	remote_numa_worker_pool_set_reject(true);
 	remote_numa_worker_pool_stop();
 	remote_numa_clean_main_trprt_if(ctx);
+	remote_numa_client_cache_destroy(client_cache);
 }
 
 module_init(remote_numa_main_node_init);

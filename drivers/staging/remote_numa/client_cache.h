@@ -27,7 +27,7 @@ typedef struct remote_numa_cached_page {
 	uintptr_t addr;
 } remote_numa_cached_page_t;
 
-typedef struct {
+typedef struct remote_numa_client_cache {
 	struct list_head lru_head;
 	struct list_head free_list;
 	spinlock_t lock;

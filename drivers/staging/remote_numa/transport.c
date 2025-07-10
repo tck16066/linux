@@ -64,6 +64,7 @@ void remote_numa_transport_ctx_destroy(remote_numa_trprt_ctx_t *ctx)
 		kfree(node);
 	}
 	rcu_read_unlock();
+	synchronize_rcu();
 	kfree(ctx);
 }
 
