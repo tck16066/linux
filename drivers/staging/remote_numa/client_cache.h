@@ -16,6 +16,8 @@
 #include "protocol.h"
 #include "transport.h"
 
+#define REMOTE_NUMA_CLIENT_CACHE_HASH_BITS 13
+
 struct remote_numa_main_trprt_if;
 
 typedef struct remote_numa_cached_page {
@@ -25,6 +27,8 @@ typedef struct remote_numa_cached_page {
 	struct list_head lru_list;
 	struct mm_struct *mm;
 	uintptr_t addr;
+	uintptr_t main_pg_cookie;
+	struct hlist_node node;
 } remote_numa_cached_page_t;
 
 typedef struct remote_numa_client_cache {
@@ -35,6 +39,7 @@ typedef struct remote_numa_client_cache {
 	u32 max_cached_pages;
 	u32 current_cached_pages;
 	struct remote_numa_main_trprt_if *trprt;
+	DECLARE_HASHTABLE(page_lookup, REMOTE_NUMA_CLIENT_CACHE_HASH_BITS);
 } remote_numa_client_cache_t;
 
 int remote_numa_client_cache_init(remote_numa_client_cache_t *cache,
@@ -53,6 +58,10 @@ struct page *remote_numa_client_cache_alloc(remote_numa_client_cache_t *cache,
 int remote_numa_client_cache_refault(remote_numa_client_cache_t *cache,
 				     struct page *faulting_page,
 				     struct vm_fault *vmf);
+
+
+int remote_numa_client_cache_free_page(remote_numa_client_cache_t *cache,
+				       struct page *page);
 
 #endif
 

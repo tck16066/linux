@@ -74,36 +74,36 @@ typedef struct
 typedef struct
 {
 	remote_numa_msg_hdr_t hdr;
-	u16 request_id;
-	u8 num_pages;
-	u8 reserved;
-	
+	u64 main_pg_cookie;
 } __attribute__((__packed__)) remote_numa_mem_alloc_t;
 
 typedef enum
 {
-	remote_numa_xfer_done = 1,
 	remote_numa_xfer_end_of_pg = 2,
 } remote_numa_mem_pg_xfer_flags_t;
 
 typedef struct
 {
 	remote_numa_msg_hdr_t hdr;
-	u16 request_id;
 	u8  flags;
-	u8  reserved;
-	u16 pg_num;
+	u8 reserved;
+	u16 reserved2;
+	u16 payload_len;
 	u16 seq_num;
 	u32 sender_pg_cookie;
+	u32 receiver_pg_cookie;
 } __attribute__((__packed__)) remote_numa_mem_pg_xfer_t;
+
+typedef struct {
+	remote_numa_msg_hdr_t hdr;
+	u64 donor_pg_cookie;
+} __attribute__((__packed__)) remote_numa_mem_refetch_t;
 
 typedef struct
 {
 	remote_numa_msg_hdr_t hdr;
-	u16 request_id;
-	u16 reserved;
-	u16 pg_num;
 	u16 max_seq_num;
+	u16 reserved;
 	u32 sender_pg_cookie;
 	u32 receiver_pg_cookie;
 } __attribute__((__packed__)) remote_numa_mem_pg_xfer_ack_t;
@@ -111,15 +111,13 @@ typedef struct
 typedef struct
 {
 	remote_numa_msg_hdr_t hdr;
-	u16 request_id;
-	u16 pg_num;
 	u32 donor_pg_cookie;
+	u32 main_pg_cookie;
 } __attribute__((__packed__)) remote_numa_mem_free_t;
 
 typedef struct
 {
 	remote_numa_msg_hdr_t hdr;
-	u16 request_id;
-	u16 pg_num;
+	u32 main_pg_cookie;
 } __attribute__((__packed__)) remote_numa_mem_free_ack_t;
 #endif

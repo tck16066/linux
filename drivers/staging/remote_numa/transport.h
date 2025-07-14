@@ -45,6 +45,7 @@ typedef enum
 	remote_numa_send_bad_alloc = 2,
 	remote_numa_send_no_if = 3,
 	remote_numa_send_bad_xmit = 4,
+	remote_numa_send_timeout = 5,
 	/*After 255, they are transport-encoded.*/
 	remote_numa_send_max = 255,
 } remote_numa_send_ret_t;
@@ -60,7 +61,8 @@ typedef enum
 	remote_numa_receive_bad_alloc = 2,
 	remote_numa_receive_bad_proto = 3,
 	remote_numa_receive_mangled_pkt = 4,
-	remote_numa_receive_bad_cookie = 4,
+	remote_numa_receive_bad_cookie = 5,
+	remote_numa_receive_out_of_bounds = 6,
 	/*After 255, they are transport-encoded.*/
 	remote_numa_receive_max = 255,
 } remote_numa_receive_ret_t;
@@ -71,7 +73,7 @@ typedef struct
 	struct hlist_node            hnode;
 	void *priv_return_info;
 
-	u64 donor_pg_cookie;
+	u32 donor_cookie;
 	u32 free_pages;
 	u8 page_size_rank;
 	bool valid_mem_resp;
@@ -89,6 +91,7 @@ typedef struct
 typedef struct remote_numa_donor_trprt_if
 {
 	u32 (*remote_numa_node_id)(remote_numa_mem_query_t *);
+	u16 (*get_max_payload_len)(void); // Does not count header.
 	void (*free_rx_buff)(void *);
 	void (*prepare_rx_buff)(void *rx_buff, void **payload);
 	void (*alloc_tx_buffer)(size_t payload_len,
@@ -107,6 +110,7 @@ typedef struct remote_numa_donor_trprt_if
 typedef struct remote_numa_main_trprt_if
 {
 	u32 (*remote_numa_node_id)(remote_numa_advert_t *);
+	u16 (*get_max_payload_len)(void); // Does not count header.
 	remote_numa_send_ret_t (*priv_return_info)(
 		void *trprt_ctx, remote_numa_main_return_info_t *info);
 	void* (*priv_return_info_from_advert)(remote_numa_advert_t *);
@@ -153,13 +157,13 @@ remote_numa_receive_ret_t remote_numa_rx_mem_alloc(
 remote_numa_send_ret_t remote_numa_transport_alloc_page_rcu(
 	remote_numa_main_trprt_if_t *trprt,
 	remote_numa_node_t *donor,
-	struct page *target);
+	struct remote_numa_cached_page *cached_target);
 
 remote_numa_send_ret_t remote_numa_transport_refetch_page(
 	remote_numa_main_trprt_if_t *trprt,
 	u32 donor_node_id,
 	u64 donor_pg_cookie,
-	struct page *target);
+	struct remote_numa_cached_page *cached_target);
 
 remote_numa_receive_ret_t remote_numa_rx_mem_pg_alloc_xfer(
 	remote_numa_main_trprt_if_t *main_if,
@@ -190,6 +194,12 @@ remote_numa_receive_ret_t remote_numa_rx_mem_pg_free(
 remote_numa_receive_ret_t remote_numa_rx_mem_pg_free_ack(
 	remote_numa_main_trprt_if_t *main_if,
 	remote_numa_mem_free_ack_t *ack);
+
+remote_numa_send_ret_t remote_numa_tx_mem_pg_free(
+	struct remote_numa_main_trprt_if *main_if,
+	u32 donor_id,
+	u64 donor_pg_cookie,
+	uintptr_t main_pg_cookie);
 
 #endif
 

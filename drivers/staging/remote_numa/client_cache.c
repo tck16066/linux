@@ -7,6 +7,8 @@
 #include <linux/rcupdate.h>
 #include "transport.h"
 
+#define REMOTE_NUMA_REFAULT_HASH_BITS 10
+
 /* assumes lock is held */
 static remote_numa_node_t *choose_donor(remote_numa_client_cache_t *cache)
 {
@@ -24,8 +26,7 @@ static remote_numa_node_t *choose_donor(remote_numa_client_cache_t *cache)
 }
 
 
-#define REFAULT_HASH_BITS 10
-DEFINE_HASHTABLE(refault_table, REFAULT_HASH_BITS);
+DEFINE_HASHTABLE(refault_table, REMOTE_NUMA_REFAULT_HASH_BITS);
 
 struct refault_entry {
 	struct mm_struct *mm;
@@ -37,7 +38,7 @@ struct refault_entry {
 
 static u32 refault_hash_key(struct mm_struct *mm, unsigned long addr)
 {
-	return hash_long(((unsigned long)mm >> 4) ^ addr, REFAULT_HASH_BITS);
+	return hash_long(((unsigned long)mm >> 4) ^ addr, REMOTE_NUMA_REFAULT_HASH_BITS);
 }
 
 static void refault_table_insert(struct mm_struct *mm, unsigned long addr,
@@ -89,6 +90,7 @@ static int maybe_evict(remote_numa_client_cache_t *cache)
 		victim = list_last_entry(&cache->lru_head,
 			remote_numa_cached_page_t, lru_list);
 		list_del(&victim->lru_list);
+		hash_del(&victim->node);
 		cache->current_cached_pages--;
 
 		if (victim->mm && victim->addr) {
@@ -131,6 +133,7 @@ static void cache_insert(remote_numa_client_cache_t *cache,
 {
 	spin_lock(&cache->lock);
 	list_add(&entry->lru_list, &cache->lru_head);
+	hash_add(cache->page_lookup, &entry->node, (uintptr_t)entry->page);
 	cache->current_cached_pages++;
 	spin_unlock(&cache->lock);
 }
@@ -146,6 +149,7 @@ int remote_numa_client_cache_init(remote_numa_client_cache_t *cache,
 	cache->current_cached_pages = 0;
 	cache->trprt = trprt;
 
+	hash_init(cache->page_lookup);
 	hash_init(refault_table);
 
 	for (u32 i = 0; i < max_cached_pages; ++i) {
@@ -174,6 +178,7 @@ void remote_numa_client_cache_destroy(remote_numa_client_cache_t *cache)
 	list_for_each_safe(pos, tmp, &cache->lru_head) {
 		entry = list_entry(pos, remote_numa_cached_page_t, lru_list);
 		list_del(pos);
+		hash_del(&entry->node);
 		__free_page(entry->page);
 		kfree(entry);
 	}
@@ -219,7 +224,7 @@ struct page *remote_numa_client_cache_alloc(remote_numa_client_cache_t *cache,
 
 	if (remote_numa_transport_alloc_page_rcu(cache->trprt,
 					     donor,
-					     entry->page)) {
+					     entry)) {
 		spin_lock(&cache->lock);
 		list_add(&entry->lru_list, &cache->free_list);
 		goto err;
@@ -267,7 +272,7 @@ int remote_numa_client_cache_refault(remote_numa_client_cache_t *cache,
 	if (remote_numa_transport_refetch_page(cache->trprt,
 						donor_id,
 						donor_pg_cookie,
-						faulting_page)) { // XXX NULL
+						entry)) { // XXX NULL
 		spin_lock(&cache->lock);
 		list_add(&entry->lru_list, &cache->free_list);
 		spin_unlock(&cache->lock);
@@ -276,5 +281,33 @@ int remote_numa_client_cache_refault(remote_numa_client_cache_t *cache,
 
 	cache_insert(cache, entry);
 	return 0;
+}
+
+int remote_numa_client_cache_free_page(remote_numa_client_cache_t *cache,
+				       struct page *page)
+{
+	remote_numa_cached_page_t *entry;
+
+	spin_lock(&cache->lock);
+	hash_for_each_possible(cache->page_lookup, entry, node, (uintptr_t)page) {
+		if (entry->page == page) {
+			list_del(&entry->lru_list);
+			cache->current_cached_pages--;
+
+			hash_del(&entry->node);  // Remove from hash
+
+			spin_unlock(&cache->lock);
+			remote_numa_tx_mem_pg_free(cache->trprt,
+				entry->donor_id,
+				entry->donor_pg_cookie,
+				(uintptr_t)entry);
+			spin_lock(&cache->lock);
+			list_add(&entry->lru_list, &cache->free_list);
+			spin_unlock(&cache->lock);
+			return 0;
+		}
+	}
+	spin_unlock(&cache->lock);
+	return -ENOENT;
 }
 

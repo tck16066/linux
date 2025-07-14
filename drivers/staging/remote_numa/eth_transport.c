@@ -54,13 +54,17 @@ static const u8 REMOTE_NUMA_SERVICE_MAC[ETH_ALEN] = {
 struct remote_numa_eth_trprt_ctx
 {
 	const char *if_name;
-	u16 max_data_len;
 };
 
 typedef struct
 {
 	u8 return_mac_addr[ETH_ALEN];
 } remote_numa_eth_priv_ret_info_t;
+
+static u16 max_payload_len(void)
+{
+	return REMOTE_NUMA_MAX_DATA_LEN;
+}
 
 static void free_rx_buff(void *buff)
 {
@@ -288,8 +292,7 @@ static remote_numa_send_ret_t remote_numa_eth_tx_advert(remote_numa_trprt_ctx_t 
 		goto done;
 	}
 	
-	payload_start->max_frame_len =
-	    ((struct remote_numa_eth_trprt_ctx *)trprt_ctx->trprt_ctx)->max_data_len;
+	payload_start->max_frame_len = max_payload_len();
 	
 	remote_numa_msg_hdr_t *hdr = &payload_start->hdr;
 	hdr->version = remote_numa_eth_advert;
@@ -353,6 +356,7 @@ remote_numa_donor_trprt_if_t *remote_numa_eth_donor_init(remote_numa_mem_mgr_t *
 
 	ptr->priv_return_info_from_mem_query = eth_priv_return_info_from_mem_query;
 	ptr->remote_numa_node_id = mem_query_to_node_id;
+	ptr->get_max_payload_len = max_payload_len;
 	ptr->alloc_tx_buffer = alloc_tx_buffer;
 	ptr->prepare_rx_buff = prepare_rx_buff;
 	ptr->free_rx_buff = free_rx_buff;
@@ -365,8 +369,6 @@ remote_numa_donor_trprt_if_t *remote_numa_eth_donor_init(remote_numa_mem_mgr_t *
 		struct remote_numa_eth_trprt_ctx, err, mem);
 	struct remote_numa_eth_trprt_ctx *eth_ctx = ptr->trprt_ctx->trprt_ctx;
 	eth_ctx->if_name = REMOTE_NUMA_IF_NAME;
-	eth_ctx->max_data_len =
-		REMOTE_NUMA_MAX_DATA_LEN - sizeof(remote_numa_msg_hdr_t);
 
 	rcu_assign_pointer(custom_net_hook, eth_skb_handler);
 
@@ -386,6 +388,7 @@ remote_numa_main_trprt_if_t *remote_numa_eth_main_init(void)
 		goto err;
 	}
 
+	ptr->get_max_payload_len = max_payload_len;
 	ptr->prepare_rx_buff = prepare_rx_buff;
 	ptr->free_rx_buff = free_rx_buff;
 	ptr->alloc_tx_buffer = alloc_tx_buffer;
@@ -398,11 +401,6 @@ remote_numa_main_trprt_if_t *remote_numa_eth_main_init(void)
 
 	REMOTE_NUMA_ALLOC_TRPRT_CTX(ptr,
 		struct remote_numa_eth_trprt_ctx, err, NULL);
-	struct remote_numa_eth_trprt_ctx *eth_ctx = ptr->trprt_ctx->trprt_ctx;
-	eth_ctx->if_name = REMOTE_NUMA_IF_NAME;
-	eth_ctx->max_data_len =
-		REMOTE_NUMA_MAX_DATA_LEN - sizeof(remote_numa_msg_hdr_t);
-
 	rcu_assign_pointer(custom_net_hook, eth_skb_handler);
 
 	return ptr;
