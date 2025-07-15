@@ -401,6 +401,8 @@ remote_numa_main_trprt_if_t *remote_numa_eth_main_init(void)
 
 	REMOTE_NUMA_ALLOC_TRPRT_CTX(ptr,
 		struct remote_numa_eth_trprt_ctx, err, NULL);
+	struct remote_numa_eth_trprt_ctx *eth_ctx = ptr->trprt_ctx->trprt_ctx;
+	eth_ctx->if_name = REMOTE_NUMA_IF_NAME;
 	rcu_assign_pointer(custom_net_hook, eth_skb_handler);
 
 	return ptr;
