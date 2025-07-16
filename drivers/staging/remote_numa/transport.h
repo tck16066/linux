@@ -72,7 +72,6 @@ typedef struct
 	u32			     node_id;
 	struct hlist_node            hnode;
 	void *priv_return_info;
-
 	u32 donor_cookie;
 	u32 free_pages;
 	u8 page_size_rank;
@@ -165,6 +164,7 @@ remote_numa_send_ret_t remote_numa_transport_refetch_page(
 	u64 donor_pg_cookie,
 	struct remote_numa_cached_page *cached_target);
 
+// XXX this is implemented wrong. no need to xfer a page
 remote_numa_receive_ret_t remote_numa_rx_mem_pg_alloc_xfer(
 	remote_numa_main_trprt_if_t *main_if,
 	remote_numa_mem_pg_xfer_t *xfer);
