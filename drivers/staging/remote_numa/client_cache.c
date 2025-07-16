@@ -239,6 +239,8 @@ err:
 	spin_unlock(&cache->lock);
 	if (need_rcu_unlock && took_rcu_lock)
 		rcu_read_unlock();
+
+	printk(KERN_ERR "Failure to allocate remote page.");
 	return NULL;
 }
 

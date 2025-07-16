@@ -252,6 +252,7 @@ remote_numa_send_ret_t remote_numa_transport_alloc_page_rcu(
 	if (remote_numa_xfer_wait_complete(xfer, 5 * HZ)) {
 		hash_del(&xfer->node);
 		kfree(xfer);
+		printk(KERN_DEBUG "Timeout waiting for remote page fulfillment.");
 		return remote_numa_send_timeout;
 	}
 
