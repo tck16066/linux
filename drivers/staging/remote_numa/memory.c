@@ -231,3 +231,5 @@ int remote_numa_mem_free_page(remote_numa_mem_mgr_t *mgr,
 	return -ENOENT;
 }
 
+EXPORT_SYMBOL_GPL(remote_numa_create_mem_mgr);
+EXPORT_SYMBOL_GPL(remote_numa_clean_mem_mgr);

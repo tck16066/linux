@@ -20,7 +20,6 @@ enum remote_numa_msg_type
 	remote_numa_mem_resp,
 	remote_numa_mem_alloc,
 	remote_numa_mem_refetch,
-	remote_numa_mem_satisfaction,
 	remote_numa_mem_sat_ack,
 	remote_numa_mem_sync,
 	remote_numa_mem_sync_ack,
@@ -98,6 +97,12 @@ typedef struct {
 	remote_numa_msg_hdr_t hdr;
 	u64 donor_pg_cookie;
 } __attribute__((__packed__)) remote_numa_mem_refetch_t;
+
+typedef struct {
+	remote_numa_msg_hdr_t hdr;
+	u64 main_pg_cookie;
+	u64 donor_pg_cookie;
+} __attribute__((__packed__)) remote_numa_mem_satisfaction_t;
 
 typedef struct
 {

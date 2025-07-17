@@ -202,7 +202,10 @@ struct page *remote_numa_client_cache_alloc(remote_numa_client_cache_t *cache,
 
 	remote_numa_cached_page_t *entry = reuse_page(cache);
 	if (!entry)
+	{
+		printk(KERN_DEBUG "reuse_page() fail.\n");
 		goto err;
+	}
 
 	/* XXX handle OOM on individual and all donors. Data race. */
 	bool need_rcu_unlock = !rcu_read_lock_held();
@@ -221,26 +224,27 @@ struct page *remote_numa_client_cache_alloc(remote_numa_client_cache_t *cache,
 	entry->addr = vmf->address;
 
 	spin_unlock(&cache->lock);
+	
+	if (need_rcu_unlock && took_rcu_lock)
+		rcu_read_unlock();
+
 
 	if (remote_numa_transport_alloc_page_rcu(cache->trprt,
 					     donor,
 					     entry)) {
+		printk(KERN_DEBUG "Call to " \
+			"remote_numa_transport_alloc_page_rcu failed.\n");
 		spin_lock(&cache->lock);
 		list_add(&entry->lru_list, &cache->free_list);
 		goto err;
 	}
 
-	if (need_rcu_unlock && took_rcu_lock)
-		rcu_read_unlock();
-
 	cache_insert(cache, entry);
 	return entry->page;
 err:
 	spin_unlock(&cache->lock);
-	if (need_rcu_unlock && took_rcu_lock)
-		rcu_read_unlock();
 
-	printk(KERN_ERR "Failure to allocate remote page.");
+	printk(KERN_DEBUG "Failure to allocate remote page.\n");
 	return NULL;
 }
 
@@ -312,4 +316,10 @@ int remote_numa_client_cache_free_page(remote_numa_client_cache_t *cache,
 	spin_unlock(&cache->lock);
 	return -ENOENT;
 }
+
+EXPORT_SYMBOL_GPL(remote_numa_client_cache_init);
+EXPORT_SYMBOL_GPL(remote_numa_client_cache_alloc);
+EXPORT_SYMBOL_GPL(remote_numa_client_cache_refault);
+EXPORT_SYMBOL_GPL(remote_numa_client_cache_destroy);
+EXPORT_SYMBOL_GPL(remote_numa_client_cache_free_page);
 
