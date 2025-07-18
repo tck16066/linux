@@ -3,8 +3,11 @@
 #include <linux/sched.h>
 #include <linux/rmap.h>
 #include <linux/hashtable.h>
-#include "client_cache.h"
+#include <linux/page-flags.h>a
 #include <linux/rcupdate.h>
+#include <linux/sched/mm.h>
+
+#include "client_cache.h"
 #include "transport.h"
 
 #define REMOTE_NUMA_REFAULT_HASH_BITS 10
@@ -21,7 +24,7 @@ static remote_numa_node_t *choose_donor(remote_numa_client_cache_t *cache)
 			break;
 		}
 	}
-
+printk("chose node id  %llu\n", node->node_id);
 	return node;
 }
 
@@ -51,14 +54,26 @@ static void refault_table_insert(struct mm_struct *mm, unsigned long addr,
 	entry->addr = addr;
 	entry->donor_pg_cookie = donor_pg_cookie;
 	entry->donor_id = donor_id;
-	hash_add(refault_table, &entry->node, refault_hash_key(mm, addr));
+	u32 key = refault_hash_key(mm, addr);
+printk("inserting refault key %d\n", key);
+	hash_add(refault_table, &entry->node, key);
 }
 
 static struct refault_entry*
 refault_table_lookup(struct mm_struct *mm, unsigned long addr)
 {
+
+printk("we are in refault_table_lookup\n");
 	struct refault_entry *entry;
 	u32 key = refault_hash_key(mm, addr);
+
+printk("and our key is %d\n", key);
+
+int bkt;
+
+hash_for_each(refault_table, bkt, entry, node) {
+    printk("refault_table[%d]: entry at %px \n", bkt, entry);
+}
 
 	hash_for_each_possible(refault_table, entry, node, key) {
 		if (entry->mm == mm && entry->addr == addr)
@@ -81,31 +96,44 @@ static void refault_table_clear(void)
 
 static int maybe_evict(remote_numa_client_cache_t *cache)
 {
+printk("maybe_Evict\n");
 	if (cache->current_cached_pages >= cache->max_cached_pages) {
 		remote_numa_cached_page_t *victim;
-
 		if (list_empty(&cache->lru_head))
 			return -ENOMEM;
-
+printk("continue with evict\n");
 		victim = list_last_entry(&cache->lru_head,
 			remote_numa_cached_page_t, lru_list);
+printk("remove from list\n");
 		list_del(&victim->lru_list);
 		hash_del(&victim->node);
 		cache->current_cached_pages--;
 
 		if (victim->mm && victim->addr) {
+printk("vma good, tell proc.\n");
 			struct vm_area_struct *vma;
-			down_read(&victim->mm->mmap_lock);
+			mmap_write_lock(victim->mm);
+printk("signalled, move on.\n");
 			vma = find_vma(victim->mm, victim->addr);
-			if (vma && victim->addr >= vma->vm_start) {
+printk("vma found, move on  %px.\n", vma);
+			if (vma && victim->addr >= vma->vm_start &&
+				victim->addr < vma->vm_end) {
+printk("zappit!\n");
+pr_info("zap: vma [%lx - %lx], addr %lx\n",
+        vma->vm_start, vma->vm_end, victim->addr);
+
 				zap_page_range_single(vma, victim->addr, PAGE_SIZE, NULL);
+printk("insert into refault\n");
 				refault_table_insert(victim->mm, victim->addr,
 						     victim->donor_pg_cookie,
 						     victim->donor_id);
 			}
-			up_read(&victim->mm->mmap_lock);
+printk("up read\n");
+			mmap_write_unlock(victim->mm);
 		}
 
+printk("start sync\n");
+		// XXX return code. we are timing out now and don't see it.
 		remote_numa_tx_mem_pg_sync_xfer(cache->trprt,
 						victim->donor_pg_cookie,
 						victim->page,
@@ -113,6 +141,7 @@ static int maybe_evict(remote_numa_client_cache_t *cache)
 
 		list_add(&victim->lru_list, &cache->free_list);
 	}
+printk("eviction done\n");
 	return 0;
 }
 
@@ -131,11 +160,9 @@ static remote_numa_cached_page_t *reuse_page(remote_numa_client_cache_t *cache)
 static void cache_insert(remote_numa_client_cache_t *cache,
 			 remote_numa_cached_page_t *entry)
 {
-	spin_lock(&cache->lock);
 	list_add(&entry->lru_list, &cache->lru_head);
 	hash_add(cache->page_lookup, &entry->node, (uintptr_t)entry->page);
 	cache->current_cached_pages++;
-	spin_unlock(&cache->lock);
 }
 
 int remote_numa_client_cache_init(remote_numa_client_cache_t *cache,
@@ -177,6 +204,7 @@ void remote_numa_client_cache_destroy(remote_numa_client_cache_t *cache)
 
 	list_for_each_safe(pos, tmp, &cache->lru_head) {
 		entry = list_entry(pos, remote_numa_cached_page_t, lru_list);
+		mmdrop(entry->mm);
 		list_del(pos);
 		hash_del(&entry->node);
 		__free_page(entry->page);
@@ -184,6 +212,7 @@ void remote_numa_client_cache_destroy(remote_numa_client_cache_t *cache)
 	}
 	list_for_each_safe(pos, tmp, &cache->free_list) {
 		entry = list_entry(pos, remote_numa_cached_page_t, lru_list);
+		mmdrop(entry->mm);
 		list_del(pos);
 		__free_page(entry->page);
 		kfree(entry);
@@ -195,7 +224,6 @@ void remote_numa_client_cache_destroy(remote_numa_client_cache_t *cache)
 struct page *remote_numa_client_cache_alloc(remote_numa_client_cache_t *cache,
 	struct vm_fault *vmf)
 {
-	spin_lock(&cache->lock);
 	if (maybe_evict(cache))
 		goto err;
 		
@@ -220,11 +248,11 @@ struct page *remote_numa_client_cache_alloc(remote_numa_client_cache_t *cache,
 
 	entry->donor_pg_cookie = 0;
 	entry->donor_id = donor->node_id;
+	entry->donor_cookie = donor->donor_cookie;
 	entry->mm = vmf->vma->vm_mm;
+	mmgrab(entry->mm);
 	entry->addr = vmf->address;
 
-	spin_unlock(&cache->lock);
-	
 	if (need_rcu_unlock && took_rcu_lock)
 		rcu_read_unlock();
 
@@ -234,7 +262,6 @@ struct page *remote_numa_client_cache_alloc(remote_numa_client_cache_t *cache,
 					     entry)) {
 		printk(KERN_DEBUG "Call to " \
 			"remote_numa_transport_alloc_page_rcu failed.\n");
-		spin_lock(&cache->lock);
 		list_add(&entry->lru_list, &cache->free_list);
 		goto err;
 	}
@@ -242,8 +269,6 @@ struct page *remote_numa_client_cache_alloc(remote_numa_client_cache_t *cache,
 	cache_insert(cache, entry);
 	return entry->page;
 err:
-	spin_unlock(&cache->lock);
-
 	printk(KERN_DEBUG "Failure to allocate remote page.\n");
 	return NULL;
 }
@@ -254,17 +279,18 @@ int remote_numa_client_cache_refault(remote_numa_client_cache_t *cache,
 {
 	if (maybe_evict(cache))
 		return -ENOMEM;
-
+printk("about to deref current.\n");
 	struct mm_struct *mm = current->mm;
+printk("deref is ok\n");
 	unsigned long addr = (unsigned long)page_address(faulting_page);
+printk("page addr found\n");
 
-	spin_lock(&cache->lock);
 	struct refault_entry *rentry = refault_table_lookup(mm, addr);
+printk("spongebob squarepants  %px\n", rentry);
 	u64 donor_pg_cookie = rentry->donor_pg_cookie;
 	u32 donor_id = rentry->donor_id;
-
+printk("about to reuse page\n");
 	remote_numa_cached_page_t *entry = reuse_page(cache);
-	spin_unlock(&cache->lock);
 
 	if (!entry)
 		return -ENOMEM;
@@ -279,9 +305,7 @@ int remote_numa_client_cache_refault(remote_numa_client_cache_t *cache,
 						donor_id,
 						donor_pg_cookie,
 						entry)) { // XXX NULL
-		spin_lock(&cache->lock);
 		list_add(&entry->lru_list, &cache->free_list);
-		spin_unlock(&cache->lock);
 		return -EIO;
 	}
 
@@ -294,26 +318,24 @@ int remote_numa_client_cache_free_page(remote_numa_client_cache_t *cache,
 {
 	remote_numa_cached_page_t *entry;
 
-	spin_lock(&cache->lock);
 	hash_for_each_possible(cache->page_lookup, entry, node, (uintptr_t)page) {
+printk("hashing for free\n");
 		if (entry->page == page) {
+printk("found a match\n");
 			list_del(&entry->lru_list);
 			cache->current_cached_pages--;
 
 			hash_del(&entry->node);  // Remove from hash
 
-			spin_unlock(&cache->lock);
+printk("call remote_numa_tx_mem_pg_free\n");
 			remote_numa_tx_mem_pg_free(cache->trprt,
 				entry->donor_id,
 				entry->donor_pg_cookie,
 				(uintptr_t)entry);
-			spin_lock(&cache->lock);
 			list_add(&entry->lru_list, &cache->free_list);
-			spin_unlock(&cache->lock);
 			return 0;
 		}
 	}
-	spin_unlock(&cache->lock);
 	return -ENOENT;
 }
 

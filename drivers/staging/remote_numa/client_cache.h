@@ -24,6 +24,7 @@ typedef struct remote_numa_cached_page {
 	struct page *page;
 	u64 donor_pg_cookie;
 	u32 donor_id;
+	u32 donor_cookie;
 	struct list_head lru_list;
 	struct mm_struct *mm;
 	uintptr_t addr;
