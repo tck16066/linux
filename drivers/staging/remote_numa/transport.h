@@ -164,11 +164,6 @@ remote_numa_send_ret_t remote_numa_transport_refetch_page(
 	u64 donor_pg_cookie,
 	struct remote_numa_cached_page *cached_target);
 
-// XXX this is implemented wrong. no need to xfer a page
-remote_numa_receive_ret_t remote_numa_rx_mem_pg_alloc_xfer(
-	remote_numa_main_trprt_if_t *main_if,
-	remote_numa_mem_pg_xfer_t *xfer);
-
 remote_numa_receive_ret_t remote_numa_rx_mem_pg_sat_ack(
 	remote_numa_main_trprt_if_t *main_if,
 	remote_numa_mem_satisfaction_t *ack);

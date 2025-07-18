@@ -89,8 +89,8 @@ typedef struct
 	u16 reserved2;
 	u16 payload_len;
 	u16 seq_num;
-	u32 sender_pg_cookie;
-	u32 receiver_pg_cookie;
+	u64 sender_pg_cookie;
+	u64 receiver_pg_cookie;
 } __attribute__((__packed__)) remote_numa_mem_pg_xfer_t;
 
 typedef struct {
@@ -109,8 +109,8 @@ typedef struct
 	remote_numa_msg_hdr_t hdr;
 	u16 max_seq_num;
 	u16 reserved;
-	u32 sender_pg_cookie;
-	u32 receiver_pg_cookie;
+	u64 sender_pg_cookie;
+	u64 receiver_pg_cookie;
 } __attribute__((__packed__)) remote_numa_mem_pg_xfer_ack_t;
 
 typedef struct

@@ -97,6 +97,7 @@ static void refault_table_clear(void)
 static int maybe_evict(remote_numa_client_cache_t *cache)
 {
 printk("maybe_Evict\n");
+	int ret = 0;
 	if (cache->current_cached_pages >= cache->max_cached_pages) {
 		remote_numa_cached_page_t *victim;
 		if (list_empty(&cache->lru_head))
@@ -134,15 +135,15 @@ printk("up read\n");
 
 printk("start sync\n");
 		// XXX return code. we are timing out now and don't see it.
-		remote_numa_tx_mem_pg_sync_xfer(cache->trprt,
+		ret = remote_numa_tx_mem_pg_sync_xfer(cache->trprt,
 						victim->donor_pg_cookie,
 						victim->page,
 						victim);
 
 		list_add(&victim->lru_list, &cache->free_list);
 	}
-printk("eviction done\n");
-	return 0;
+printk("eviction done   %d\n", ret);
+	return ret;
 }
 
 static remote_numa_cached_page_t *reuse_page(remote_numa_client_cache_t *cache)
