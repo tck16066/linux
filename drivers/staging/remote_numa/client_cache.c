@@ -280,9 +280,9 @@ int remote_numa_client_cache_refault(remote_numa_client_cache_t *cache,
 	if (maybe_evict(cache))
 		return -ENOMEM;
 printk("about to deref current.\n");
-	struct mm_struct *mm = current->mm;
+	struct mm_struct *mm = vmf->vma->vm_mm;
 printk("deref is ok\n");
-	unsigned long addr = (unsigned long)page_address(faulting_page);
+	unsigned long addr = vmf->address;
 printk("page addr found\n");
 
 	struct refault_entry *rentry = refault_table_lookup(mm, addr);

@@ -147,7 +147,8 @@ static remote_numa_node_t *__remote_numa_get_or_add_node(
 	void *(*make_priv_return_info)(void *type),
 	void *type)
 {
-
+printk("__remote_numa_get_or_add_node %px, %px, %d, %px, %px\n",
+	context, lock, node_id, make_priv_return_info, type);
 	remote_numa_node_t *iter_node;
 
 	rcu_read_lock();
@@ -916,6 +917,7 @@ remote_numa_receive_ret_t remote_numa_rx_mem_pg_free(
 	remote_numa_donor_trprt_if_t *donor_if,
 	remote_numa_mem_free_t *pg_free)
 {
+printk("received pg free!   %px   %px\n", donor_if,  pg_free);
 	if (remote_numa_mem_free_page(donor_if->trprt_ctx->mem,
 	                              pg_free->donor_pg_cookie) != 0)
 		return remote_numa_receive_bad_cookie;
@@ -925,21 +927,25 @@ remote_numa_receive_ret_t remote_numa_rx_mem_pg_free(
 	remote_numa_mem_free_ack_t *ack;
 	void **v = (void **)&ack;
 
+printk("alloc buffer\n");
 	donor_if->alloc_tx_buffer(sizeof(*ack), &tx_buf, v);
 	if (!tx_buf || !ack)
 		return remote_numa_receive_bad_alloc;
 
+printk("alloc good\n");
 	ack->hdr.version        = remote_numa_protocol_0_1;
 	ack->hdr.type           = remote_numa_mem_free_ack;
 	ack->hdr.main_cookie    = pg_free->hdr.main_cookie;
 	ack->hdr.donor_cookie   = pg_free->hdr.donor_cookie;
 	ack->main_pg_cookie     = pg_free->main_pg_cookie;
 
+printk("node lookup for   pg_free->hdr.donor_cookie  %px\n", pg_free->hdr.donor_cookie);
 	remote_numa_node_t *main_node = __remote_numa_get_node_locking(
 		donor_if->trprt_ctx->node_table,
 		REMOTE_NUMA_HASH_TABLE_ORDER,
 		pg_free->hdr.donor_cookie);
 
+printk("lookup res:  %px\n", main_node);
 	return donor_if->tx_msg(donor_if->trprt_ctx,
 	                        main_node->priv_return_info,
 	                        tx_buf) == 0
@@ -1016,7 +1022,7 @@ remote_numa_send_ret_t remote_numa_tx_mem_pg_free(
 	msg->hdr.version        = remote_numa_protocol_0_1;
 	msg->hdr.type           = remote_numa_mem_free;
 	msg->hdr.main_cookie    = donor_id;
-	msg->hdr.donor_cookie   = 0; // TODO we shouldn't need this. Re-evalute these.
+	msg->hdr.donor_cookie   = donor->donor_cookie;
 	msg->donor_pg_cookie    = donor_pg_cookie;
 	msg->main_pg_cookie     = main_pg_cookie;
 
