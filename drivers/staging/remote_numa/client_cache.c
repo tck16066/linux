@@ -266,6 +266,7 @@ struct page *remote_numa_client_cache_alloc(remote_numa_client_cache_t *cache,
 		list_add(&entry->lru_list, &cache->free_list);
 		goto err;
 	}
+printk("we alloc a page %px\n", entry->page);
 
 	cache_insert(cache, entry);
 	return entry->page;

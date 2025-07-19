@@ -39,13 +39,12 @@ typedef struct main_xfer_state {
 		struct remote_numa_main_trprt_if *main_trprt;
 		struct remote_numa_donor_trprt_if *donor_trprt;
 	};
-	union {
-		// Used when receiving a page (e.g., alloc/refetch)
-		unsigned long received_bitmap[BITS_TO_LONGS(PAGE_SIZE)];
+	// Used when receiving a page (e.g., alloc/refetch)
+	unsigned long received_bitmap[BITS_TO_LONGS(PAGE_SIZE)];
 
-		// Used when sending a page (e.g., sync/satisfaction)
-		unsigned long sent_bitmap[BITS_TO_LONGS(PAGE_SIZE)];
-	};
+	// Used when sending a page (e.g., sync/satisfaction)
+	unsigned long sent_bitmap[BITS_TO_LONGS(PAGE_SIZE)];
+
 	void *return_info;
 } main_xfer_state_t;
 
@@ -119,7 +118,7 @@ static int remote_numa_xfer_wait_complete(main_xfer_state_t *xfer, unsigned long
 printk("xfer done check  %d\n", xfer_compute_max_contig(xfer));
 	int ret = wait_event_timeout(
 		xfer->waitq,
-		xfer->acked_max_seq_num >= PAGE_SIZE,
+		xfer_compute_max_contig(xfer) >= PAGE_SIZE,//xfer->acked_max_seq_num >= PAGE_SIZE,
 		timeout_jiffies) > 0 ? 0 : -ETIMEDOUT;
 	return ret;
 }
@@ -266,9 +265,9 @@ static void remote_numa_retry_xfers(struct work_struct *work)
 		u16 seg_len = max_payload - sizeof(remote_numa_mem_pg_xfer_t);
 
 		for (u32 offset = 0; offset < PAGE_SIZE; offset += seg_len) {
-			if (!test_bit(offset / seg_len, xfer->sent_bitmap))
+			if (!test_bit(offset, xfer->sent_bitmap))
 				continue;
-			if (offset < xfer->acked_max_seq_num)
+			if (test_bit(offset, xfer->received_bitmap))
 				continue;
 			remote_numa_send_segment(xfer, offset, seg_len);
 		}
@@ -533,7 +532,7 @@ remote_numa_receive_ret_t remote_numa_rx_mem_pg_sat_ack(
 	}
 
 	// small hack here to signify "done."
-	xfer->acked_max_seq_num = PAGE_SIZE;
+	bitmap_fill(xfer->received_bitmap, PAGE_SIZE);
 
 	xfer->cached_pg->donor_pg_cookie = ack->donor_pg_cookie;
 	wake_up(&xfer->waitq);
@@ -554,8 +553,7 @@ if(!xfer) printk("bad lookup, man.\n");
 	if (ack->max_seq_num > xfer->acked_max_seq_num)
 		xfer->acked_max_seq_num = ack->max_seq_num;
 
-	// For future robustness: could also set bitmap of acked segments (if desired)
-
+	bitmap_set(xfer->received_bitmap, 0, ack->max_seq_num);
 
 printk("awaken?  %d    %d  %d\n", xfer->acked_max_seq_num >= PAGE_SIZE, xfer->acked_max_seq_num, PAGE_SIZE);
 	if (xfer->acked_max_seq_num >= PAGE_SIZE)

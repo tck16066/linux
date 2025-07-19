@@ -26,6 +26,7 @@ extern remote_numa_client_cache_t *client_cache;
 remote_numa_client_cache_t *global_remote_cache = NULL;
 
 #define TEST_CACHE_PAGES 2
+#define TOTAL_TEST_PAGES 10
 #define REMOTE_NUMA_RUN_TEST _IOW('R', 1, unsigned long)
 
 static dev_t devno;
@@ -37,7 +38,7 @@ static int test_page_lifecycle(remote_numa_client_cache_t *cache, unsigned long 
 {
     struct vm_fault fake_vmf;
     struct vm_area_struct *vma;
-    struct page *pages[TEST_CACHE_PAGES + 1];
+    struct page *pages[TOTAL_TEST_PAGES];
     int ret;
 
     if (!current->mm) {
@@ -58,21 +59,49 @@ static int test_page_lifecycle(remote_numa_client_cache_t *cache, unsigned long 
     struct vm_area_struct fake_vma = *vma;
     memset(&fake_vmf, 0, sizeof(fake_vmf));
     *((struct vm_area_struct **)&fake_vmf.vma) = &fake_vma;
-    *((unsigned long *)&fake_vmf.address) = addr;
 
-    for (int i = 0; i < TEST_CACHE_PAGES + 1; i++) {
+    // Allocate and fill each page with a unique pattern
+    for (int i = 0; i < TOTAL_TEST_PAGES; i++) {
+        *((unsigned long *)&fake_vmf.address) = addr + (i * PAGE_SIZE);
+
         pages[i] = remote_numa_client_cache_alloc(cache, &fake_vmf);
         if (!pages[i]) {
             printk(KERN_ERR "[TEST] Allocation %d failed\n", i);
             return -ENOMEM;
         }
         printk(KERN_INFO "[TEST] Allocation %d succeeded\n", i);
+
+        void *kaddr = kmap_local_page(pages[i]);
+        memset(kaddr, i, PAGE_SIZE);
+        kunmap_local(kaddr);
+    }
+
+    // Refault and verify each page
+    for (int i = 0; i < TOTAL_TEST_PAGES; i++) {
+        *((unsigned long *)&fake_vmf.address) = addr + (i * PAGE_SIZE);
+
+        ret = remote_numa_client_cache_refault(cache, pages[i], &fake_vmf);
+        if (ret) {
+            printk(KERN_ERR "[TEST] Refault %d failed with error %d\n", i, ret);
+            continue;
+        }
+
+        struct page *pg = pages[i];  // assume the pointer is valid again
+        void *kaddr = kmap_local_page(pg);
+        unsigned char val = *(unsigned char *)kaddr;
+        kunmap_local(kaddr);
+
+        if (val != i)
+            printk(KERN_ERR "[TEST] Refaulted page %d has incorrect data: %u\n", i, val);
+        else
+            printk(KERN_INFO "[TEST] Refaulted page %d verified\n", i);
     }
 
     printk(KERN_INFO "[TEST] Forcing eviction of first page\n");
     remote_numa_client_cache_free_page(cache, pages[0]);
 
     printk(KERN_INFO "[TEST] Attempting to refault evicted page...\n");
+    *((unsigned long *)&fake_vmf.address) = addr; // address for pages[0]
     ret = remote_numa_client_cache_refault(cache, pages[0], &fake_vmf);
     if (ret)
         printk(KERN_ERR "[TEST] Refault failed with error %d\n", ret);
