@@ -19,7 +19,7 @@
 #define REMOTE_NUMA_XFER_HASH_BITS 12
 #define REMOTE_NUMA_REXMIT_CHECK_MS (HZ / 40)
 
-#define REMOTE_NUMA_MAX_RETRY_INTERVAL_MS (HZ / 20)  // Retry every 50ms
+#define REMOTE_NUMA_RETRY_INTERVAL_NS (50 * NSEC_PER_MSEC)
 #define REMOTE_NUMA_MAX_RETRY_COUNT 8
 
 DEFINE_HASHTABLE(xfer_table, REMOTE_NUMA_XFER_HASH_BITS);
@@ -67,6 +67,7 @@ static remote_numa_send_ret_t tx_msg(
 	main_xfer_state_t *xfer, void *msg)
 {
 printk("xfer  %d  xfer->main_trprt->trprt_ctx %px \n", xfer->is_main_node,xfer->main_trprt->trprt_ctx);
+printk("return info: %px\n", xfer->return_info);
 	if (xfer->is_main_node)
 		return xfer->main_trprt->tx_msg(
 			xfer->main_trprt->trprt_ctx,
@@ -115,11 +116,11 @@ static u32 xfer_compute_max_contig(main_xfer_state_t *x)
 
 static int remote_numa_xfer_wait_complete(main_xfer_state_t *xfer, unsigned long timeout_jiffies)
 {
-printk("xfer done check  %d\n", xfer_compute_max_contig(xfer));
 	int ret = wait_event_timeout(
 		xfer->waitq,
 		xfer_compute_max_contig(xfer) >= PAGE_SIZE,//xfer->acked_max_seq_num >= PAGE_SIZE,
 		timeout_jiffies) > 0 ? 0 : -ETIMEDOUT;
+printk("xfer done check  %d\n", xfer_compute_max_contig(xfer));
 	return ret;
 }
 
@@ -234,7 +235,11 @@ static int remote_numa_send_segment(main_xfer_state_t *xfer, u32 offset, u16 seg
 
 	set_bit(offset / seg_len, xfer->sent_bitmap);
 
-	return tx_msg(xfer, tx_buf);
+	int ret = tx_msg(xfer, tx_buf);
+
+	printk("tx res: %d\m", ret);
+
+	return ret;
 }
 
 static void remote_numa_retry_xfers(struct work_struct *work)
@@ -318,6 +323,7 @@ static remote_numa_node_t *__remote_numa_get_node_locking(struct hlist_head *tab
 	return node;
 }
 
+#include <linux/delay.h>
 static void remote_numa_send_all_segments(main_xfer_state_t *xfer, u16 seg_len)
 {
 	for (u32 offset = 0; offset < PAGE_SIZE; offset += seg_len) {
@@ -352,7 +358,7 @@ remote_numa_send_ret_t remote_numa_transport_alloc_page_rcu(
 	xfer->return_info = donor->priv_return_info;
 	init_waitqueue_head(&xfer->waitq);
 	bitmap_zero(xfer->sent_bitmap, PAGE_SIZE);
-	xfer->retry_deadline = ktime_add_ns(ktime_get(), REMOTE_NUMA_MAX_RETRY_INTERVAL_MS * 1000 * 1000);
+	xfer->retry_deadline = ktime_add_ns(ktime_get(), REMOTE_NUMA_RETRY_INTERVAL_NS);
 	xfer->retry_count = 0;
 
 	hash_add(xfer_table, &xfer->node, xfer_hash(main_pg_cookie));
@@ -700,6 +706,8 @@ remote_numa_receive_ret_t remote_numa_donor_rx(
 	remote_numa_msg_hdr_t *hdr = payload;
 	if (hdr->version != REMOTE_NUMA_SUPPORTED_PROTO)
 	{
+printk("BAAAAD proto!\n");
+printk("payload=%px\n", payload);
 		ret = REMOTE_NUMA_TRPRT_RET(remote_numa_receive_bad_proto, 1);
 		goto done;
 	}
@@ -707,23 +715,32 @@ remote_numa_receive_ret_t remote_numa_donor_rx(
 	switch(hdr->type)
 	{
 	case remote_numa_mem_query:
+printk("rx a remote_numa_mem_query\n");
 		ret = remote_numa_rx_mem_query(donor_if, payload);
 		goto done;
 	case remote_numa_mem_alloc:
+printk("rx a remote_numa_mem_alloc\n");
 		ret = remote_numa_rx_mem_alloc(donor_if, payload);
 		goto done;
 	case remote_numa_mem_sync:
+printk("rx a remote_numa_mem_sync\n");
 		ret = remote_numa_rx_mem_pg_sync_xfer(donor_if, payload);
 		goto done;
 	case remote_numa_mem_free:
+printk("rx a remote_numa_mem_free\n");
 		ret = remote_numa_rx_mem_pg_free(donor_if, payload);
 		goto done;
 	default:
 		ret = REMOTE_NUMA_TRPRT_RET(remote_numa_receive_mangled_pkt, 1);
+		printk("error processing pkt... unknown type\n");
 		goto done;
 	}
 done:
-	donor_if->free_rx_buff(rx_data);	
+	donor_if->free_rx_buff(rx_data);
+
+	if (ret)
+		printk("error processing pkt\n");
+
 	return ret;
 }
 

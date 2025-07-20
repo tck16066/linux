@@ -41,6 +41,7 @@ struct refault_entry {
 
 static u32 refault_hash_key(struct mm_struct *mm, unsigned long addr)
 {
+printk("hashing  %px   %d  \n", mm, addr);
 	return hash_long(((unsigned long)mm >> 4) ^ addr, REMOTE_NUMA_REFAULT_HASH_BITS);
 }
 
