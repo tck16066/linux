@@ -264,20 +264,7 @@ static void prepare_rx_buff(void *rx_buff, void **payload)
 {
 
 	struct sk_buff *skb = rx_buff;
-
-
-printk("skb->len = %u\n", skb->len);
-
-print_hex_dump(KERN_ERR, "rx MH: ", DUMP_PREFIX_ADDRESS, 16, 1,
-               eth_hdr(skb), sizeof(struct ethhdr), false);
-
-print_hex_dump(KERN_ERR, "rx first 64: ", DUMP_PREFIX_ADDRESS, 16, 1,
-               skb->data, min(skb->len, 64U), false);
-
-if (skb->len >= ETH_HLEN + 64) {
-	print_hex_dump(KERN_ERR, "rx RNH + page: ", DUMP_PREFIX_ADDRESS, 16, 1,
-	               skb->data + ETH_HLEN, 64, false);
-}
+	skb_linearize(skb);
 
 	u8 *pay = skb_mac_header_was_set(skb) ?
 		skb_mac_header(skb) + ETH_HLEN :

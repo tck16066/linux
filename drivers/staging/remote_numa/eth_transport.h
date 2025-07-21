@@ -14,7 +14,8 @@
 #include "protocol.h"
 #include "transport.h"
 
-#define REMOTE_NUMA_ETHERTYPE htons(0x88B5)
+//#define REMOTE_NUMA_ETHERTYPE htons(0x88B5)
+#define REMOTE_NUMA_ETHERTYPE htons(0xA1A1)
 
 typedef custom_net_hook_ret_t (*skb_handler_t)(struct sk_buff *);
 

@@ -66,6 +66,8 @@ remote_numa_mem_mgr_t *remote_numa_create_mem_mgr(size_t num_pages)
 	if (!mgr)
 		return NULL;
 
+	atomic64_set(&mgr->cookie_gen, 123);
+
 	mgr->num_pools = DIV_ROUND_UP(num_pages, REMOTE_NUMA_POOL_SIZE);
 	mgr->num_pages = mgr->num_pools * REMOTE_NUMA_POOL_SIZE;
 	mgr->free_pages = mgr->num_pages;

@@ -121,11 +121,9 @@ printk("vma found, move on  %px.\n", vma);
 			if (vma && victim->addr >= vma->vm_start &&
 				victim->addr < vma->vm_end) {
 printk("zappit!\n");
-pr_info("zap: vma [%lx - %lx], addr %lx\n",
-        vma->vm_start, vma->vm_end, victim->addr);
 
 				zap_page_range_single(vma, victim->addr, PAGE_SIZE, NULL);
-printk("insert into refault\n");
+printk("insert cookie into refault  %llu\n", victim->donor_pg_cookie);
 				refault_table_insert(victim->mm, victim->addr,
 						     victim->donor_pg_cookie,
 						     victim->donor_id);
@@ -141,6 +139,7 @@ printk("start sync\n");
 						victim->page,
 						victim);
 
+printk("victim donor pg cookie %llu\n", victim->donor_pg_cookie);
 		list_add(&victim->lru_list, &cache->free_list);
 	}
 printk("eviction done   %d\n", ret);
@@ -267,7 +266,7 @@ struct page *remote_numa_client_cache_alloc(remote_numa_client_cache_t *cache,
 		list_add(&entry->lru_list, &cache->free_list);
 		goto err;
 	}
-printk("we alloc a page %px\n", entry->page);
+printk("we alloc a page cookie %px\n", entry->donor_pg_cookie);
 
 	cache_insert(cache, entry);
 	return entry->page;
@@ -282,7 +281,7 @@ int remote_numa_client_cache_refault(remote_numa_client_cache_t *cache,
 {
 	if (maybe_evict(cache))
 		return -ENOMEM;
-printk("about to deref current.\n");
+printk("about to deref vmf vma.\n");
 	struct mm_struct *mm = vmf->vma->vm_mm;
 printk("deref is ok\n");
 	unsigned long addr = vmf->address;
@@ -295,6 +294,7 @@ printk("spongebob squarepants  %px\n", rentry);
 printk("about to reuse page\n");
 	remote_numa_cached_page_t *entry = reuse_page(cache);
 
+printk("out of reuse_page() %px\n", entry);
 	if (!entry)
 		return -ENOMEM;
 
@@ -304,6 +304,7 @@ printk("about to reuse page\n");
 	entry->mm = vmf->vma->vm_mm;
 	entry->addr = vmf->address;
 
+printk("now refetch page\n");
 	if (remote_numa_transport_refetch_page(cache->trprt,
 						donor_id,
 						donor_pg_cookie,
@@ -312,7 +313,10 @@ printk("about to reuse page\n");
 		return -EIO;
 	}
 
+printk("now insert into cache\n");
 	cache_insert(cache, entry);
+
+printk("now exit remote_numa_client_cache_refault\n");
 	return 0;
 }
 

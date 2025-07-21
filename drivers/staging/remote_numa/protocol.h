@@ -74,6 +74,7 @@ typedef struct
 {
 	remote_numa_msg_hdr_t hdr;
 	u64 main_pg_cookie;
+	int hack;
 } __attribute__((__packed__)) remote_numa_mem_alloc_t;
 
 typedef enum
@@ -91,6 +92,7 @@ typedef struct
 	u16 seq_num;
 	u64 sender_pg_cookie;
 	u64 receiver_pg_cookie;
+	int hack;
 } __attribute__((__packed__)) remote_numa_mem_pg_xfer_t;
 
 typedef struct {
@@ -102,6 +104,7 @@ typedef struct {
 	remote_numa_msg_hdr_t hdr;
 	u64 main_pg_cookie;
 	u64 donor_pg_cookie;
+	int hack;
 } __attribute__((__packed__)) remote_numa_mem_satisfaction_t;
 
 typedef struct
@@ -111,6 +114,7 @@ typedef struct
 	u16 reserved;
 	u64 sender_pg_cookie;
 	u64 receiver_pg_cookie;
+	int hack;
 } __attribute__((__packed__)) remote_numa_mem_pg_xfer_ack_t;
 
 typedef struct
