@@ -196,5 +196,7 @@ remote_numa_send_ret_t remote_numa_tx_mem_pg_free(
 	u64 donor_pg_cookie,
 	uintptr_t main_pg_cookie);
 
+void tmp_init(void);
+
 #endif
 

@@ -15,6 +15,7 @@
 #include <linux/types.h>
 
 #include "client_cache.h"
+#include "transport.h"
 #include "eth_transport.h"
 #include "protocol.h"
 #include "worker_pool.h"
@@ -37,6 +38,7 @@ static remote_numa_receive_ret_t rx_wrapper(void *frame)
 static int __init
 remote_numa_main_node_init(void)
 {
+	tmp_init();
 	remote_numa_worker_pool_init(rx_wrapper, WORKER_POOL_SIZE);
 	ctx = remote_numa_eth_main_init();
 	if (!ctx)

@@ -110,8 +110,8 @@ typedef struct {
 typedef struct
 {
 	remote_numa_msg_hdr_t hdr;
-	u16 max_seq_num;
-	u16 reserved;
+	u16 bottom_seq_num;
+	u16 top_seq_num;
 	u64 sender_pg_cookie;
 	u64 receiver_pg_cookie;
 	int hack;

@@ -164,13 +164,18 @@ int remote_numa_mem_lookup_page(remote_numa_mem_mgr_t *mgr,
 	u32 h = cookie_hash(cookie);
 	struct hlist_head *head = &mgr->cookie_table[h];
 	remote_numa_page_t *pg;
+	
+	unsigned long flags;
+	spin_lock_irqsave(&mgr->lock, flags);
 
 	hlist_for_each_entry(pg, head, hnode) {
 		if (pg->donor_pg_cookie == cookie) {
+		spin_unlock_irqrestore(&mgr->lock, flags);
 			*page_out = pg->addr;
 			return 0;
 		}
 	}
+	spin_unlock_irqrestore(&mgr->lock, flags);
 	return -ENOENT;
 }
 
@@ -216,11 +221,11 @@ printk("remote_numa_mem_free_page  mgr  %px   cookie %llu\n",
 	struct hlist_head *head = &mgr->cookie_table[h];
 	remote_numa_page_t *pg;
 
+	unsigned long flags;
+	spin_lock_irqsave(&mgr->lock, flags);
 	hlist_for_each_entry(pg, head, hnode)
 	{
 		if (pg->donor_pg_cookie == cookie) {
-			unsigned long flags;
-			spin_lock_irqsave(&mgr->lock, flags);
 			if (!pg->in_use) {
 				spin_unlock_irqrestore(&mgr->lock, flags);
 				return -EINVAL;
@@ -232,6 +237,7 @@ printk("remote_numa_mem_free_page  mgr  %px   cookie %llu\n",
 			return 0;
 		}
 	}
+	spin_unlock_irqrestore(&mgr->lock, flags);
 	return -ENOENT;
 }
 

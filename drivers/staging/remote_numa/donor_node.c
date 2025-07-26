@@ -16,6 +16,7 @@
 #include <linux/random.h>
 #include <linux/skbuff.h>
 
+#include "transport.h"
 #include "eth_transport.h"
 #include "protocol.h"
 #include "worker_pool.h"
@@ -53,6 +54,7 @@ advert_thread(void *data)
 static int __init
 remote_numa_donor_node_init(void)
 {
+	tmp_init();
 	mem = remote_numa_create_mem_mgr(REMOTE_NUMA_NUM_PGS);
 	if (!mem)
 		return -ENOMEM;
