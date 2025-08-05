@@ -19,7 +19,7 @@
 
 typedef custom_net_hook_ret_t (*skb_handler_t)(struct sk_buff *);
 
-remote_numa_donor_trprt_if_t *remote_numa_eth_donor_init(remote_numa_mem_mgr_t *mem);
+remote_numa_donor_trprt_if_t *remote_numa_eth_donor_init(struct remote_numa_mem_mgr *mem);
 void remote_numa_clean_donor_trprt_if(remote_numa_donor_trprt_if_t *iface);
 
 remote_numa_main_trprt_if_t *remote_numa_eth_main_init(void );

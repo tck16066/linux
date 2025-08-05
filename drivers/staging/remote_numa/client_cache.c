@@ -70,12 +70,11 @@ refault_table_lookup(struct mm_struct *mm, unsigned long addr)
 
 int bkt;
 
-hash_for_each(refault_table, bkt, entry, node) {
-}
-
+printk("dummpit\n");
 	hash_for_each_possible(refault_table, entry, node, key) {
 		if (entry->mm == mm && entry->addr == addr)
 			return entry;
+		printk("mm  %px  entry addr  %llu\n", entry->mm, entry->addr);
 	}
 	return NULL;
 }
@@ -126,12 +125,10 @@ printk("done sync client\n\n");
 				victim->addr < vma->vm_end) {
 
 				zap_page_range_single(vma, victim->addr, PAGE_SIZE, NULL);
-#if 0
 printk("insert cookie into refault  %llu\n", victim->donor_pg_cookie);
 				refault_table_insert(victim->mm, victim->addr,
 						     victim->donor_pg_cookie,
 						     victim->donor_id);
-#endif
 			}
 			mmap_write_unlock(victim->mm);
 		}
@@ -276,6 +273,8 @@ err:
 	return NULL;
 }
 
+int here = 0;
+
 int remote_numa_client_cache_refault(remote_numa_client_cache_t *cache,
 				     struct page *faulting_page,
 				     struct vm_fault *vmf)
@@ -285,8 +284,15 @@ int remote_numa_client_cache_refault(remote_numa_client_cache_t *cache,
 	struct mm_struct *mm = vmf->vma->vm_mm;
 	unsigned long addr = vmf->address;
 
+	// theory/observation: it blows up on the 10th/10th refault
+	// from the caller. All of the calls currently fail with EIO
+	// except the last one, which crashes. This last entry won't
+	// actually be in the refault table because we never evicted
+	// it! So of course the lookup fails, and we crash.
 	struct refault_entry *rentry = refault_table_lookup(mm, addr);
-	u64 donor_pg_cookie = rentry->donor_pg_cookie;
+printk("here  %d\n", here++);
+	u64 donor_pg_cookie = rentry->donor_pg_cookie; //EXPLOSION HERE
+printk("there \n");
 	u32 donor_id = rentry->donor_id;
 	remote_numa_cached_page_t *entry = reuse_page(cache);
 
@@ -302,7 +308,7 @@ int remote_numa_client_cache_refault(remote_numa_client_cache_t *cache,
 	if (remote_numa_transport_refetch_page(cache->trprt,
 						donor_id,
 						donor_pg_cookie,
-						entry)) { // XXX NULL
+						entry)) {
 		list_add(&entry->lru_list, &cache->free_list);
 		return -EIO;
 	}

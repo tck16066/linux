@@ -344,7 +344,7 @@ static remote_numa_receive_ret_t remote_numa_eth_rx_mem_resp
 	return REMOTE_NUMA_TRPRT_RET(remote_numa_receive_err_unknown, 0);
 }
 
-remote_numa_donor_trprt_if_t *remote_numa_eth_donor_init(remote_numa_mem_mgr_t *mem)
+remote_numa_donor_trprt_if_t *remote_numa_eth_donor_init(struct remote_numa_mem_mgr *mem)
 {
 	get_random_bytes(&net_secret, sizeof(net_secret));
 

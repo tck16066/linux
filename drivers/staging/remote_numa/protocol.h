@@ -98,6 +98,7 @@ typedef struct
 typedef struct {
 	remote_numa_msg_hdr_t hdr;
 	u64 donor_pg_cookie;
+	u64 main_pg_cookie;
 } __attribute__((__packed__)) remote_numa_mem_refetch_t;
 
 typedef struct {

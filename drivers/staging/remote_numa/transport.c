@@ -12,6 +12,7 @@
 #include <linux/spinlock_types.h>
 #include <linux/types.h>
 
+#include "memory.h"
 #include "transport.h"
 
 #define REMOTE_NUMA_SUPPORTED_PROTO  remote_numa_protocol_0_1
@@ -93,6 +94,10 @@ static u16 xfer_state_max_payload(
 	else
 		return xfer->donor_trprt->get_max_payload_len();
 }
+
+static remote_numa_receive_ret_t remote_numa_rx_mem_pg_refetch(
+	struct remote_numa_donor_trprt_if *donor_if,
+	remote_numa_mem_refetch_t *refetch);
 
 static remote_numa_node_t *
 __remote_numa_get_or_add_node(
@@ -253,11 +258,10 @@ static int remote_numa_send_segment(main_xfer_state_t *xfer, u32 offset, u16 seg
 
 static void remote_numa_retry_xfers(struct work_struct *work)
 {
-return;
-	if (hash_empty(xfer_table))
-	{
-		schedule_delayed_work(&remote_numa_retry_work, msecs_to_jiffies(REMOTE_NUMA_RETRY_INTERVAL_MS));
-    		return;
+	if (hash_empty(xfer_table)) {
+		schedule_delayed_work(&remote_numa_retry_work,
+			msecs_to_jiffies(REMOTE_NUMA_RETRY_INTERVAL_MS));
+		return;
 	}
 
 	u64 now_ns = ktime_get_ns();
@@ -265,32 +269,49 @@ return;
 	int bkt;
 
 	hash_for_each(xfer_table, bkt, xfer, node) {
+		if (xfer->is_main_node)
+			continue; // Let main node manage its own cleanup
+
+		if (xfer_compute_max_contig(xfer) >= PAGE_SIZE) {
+			// Transfer complete – clean it up
+			spin_lock(&hacky_spinlock);
+			hash_del(&xfer->node);
+			spin_unlock(&hacky_spinlock);
+			kfree(xfer);
+			continue;
+		}
+
 		if (ktime_to_ns(xfer->retry_deadline) >= now_ns)
 			continue;
 
 		if (xfer->retry_count >= REMOTE_NUMA_MAX_RETRY_COUNT) {
-			printk(KERN_WARNING "remote_numa: transfer timeout\n");
-			wake_up(&xfer->waitq);
+			printk(KERN_WARNING "remote_numa: donor xfer timeout\n");
+			spin_lock(&hacky_spinlock);
+			hash_del(&xfer->node);
+			spin_unlock(&hacky_spinlock);
+			kfree(xfer);
 			continue;
 		}
+
 		u16 max_payload = xfer_state_max_payload(xfer);
 		u16 seg_len = max_payload - sizeof(remote_numa_mem_pg_xfer_t);
-printk("retransmitting   %d\n", seg_len);
 
 		for (u32 offset = 0; offset < PAGE_SIZE; offset += seg_len) {
-			if (!test_bit(offset, xfer->sent_bitmap))
+			if (!test_bit(offset / seg_len, xfer->sent_bitmap))
 				continue;
 			if (test_bit(offset, xfer->received_bitmap))
 				continue;
-printk("sending segment\n");
+
 			remote_numa_send_segment(xfer, offset, seg_len);
 		}
+
 		xfer->retry_count++;
 		xfer->retry_deadline = ktime_add_ns(ktime_get(),
 			REMOTE_NUMA_REXMIT_CHECK_MS * NSEC_PER_MSEC);
 	}
 
-	schedule_delayed_work(&remote_numa_retry_work, msecs_to_jiffies(REMOTE_NUMA_RETRY_INTERVAL_MS));
+	schedule_delayed_work(&remote_numa_retry_work,
+		msecs_to_jiffies(REMOTE_NUMA_RETRY_INTERVAL_MS));
 }
 
 static void remote_numa_start_retry_worker(void)
@@ -337,6 +358,73 @@ static void remote_numa_send_all_segments(main_xfer_state_t *xfer, u16 seg_len)
 	for (u32 offset = 0; offset < PAGE_SIZE; offset += seg_len) {
 		remote_numa_send_segment(xfer, offset, seg_len);
 	}
+}
+
+static remote_numa_receive_ret_t remote_numa_rx_mem_pg_refetch(
+	struct remote_numa_donor_trprt_if *donor_if,
+	remote_numa_mem_refetch_t *refetch)
+{
+	struct remote_numa_mem_mgr *mgr = donor_if->trprt_ctx->mem;
+	if (!mgr)
+		return remote_numa_receive_err_unknown;
+
+	void *page_ptr;
+	remote_numa_page_t *rn_pg;
+	struct remote_numa_cached_page *cached_pg;
+	if (remote_numa_mem_lookup_page(mgr, refetch->donor_pg_cookie,
+	                                 &page_ptr, &rn_pg) != 0)
+		return remote_numa_receive_bad_cookie;
+	cached_pg = &rn_pg->cached_pg;
+
+	struct page *pg = virt_to_page(page_ptr);
+	if (!pg)
+		return remote_numa_receive_err_unknown;
+
+	remote_numa_node_t *main_node = __remote_numa_get_node_locking(
+		donor_if->trprt_ctx->node_table,
+		REMOTE_NUMA_HASH_TABLE_ORDER,
+		refetch->hdr.donor_cookie);
+	if (!main_node)
+		return remote_numa_receive_err_unknown;
+
+	main_xfer_state_t *xfer = kzalloc(sizeof(*xfer), GFP_KERNEL);
+	if (!xfer)
+		return remote_numa_receive_bad_alloc;
+
+	// TODO, this is super confusing, need to rename some fields.
+	// These donor/main pg cookies need to be backwards since
+	// they're referred to by donor/main name in the send* function.
+	
+	cached_pg->main_pg_cookie = rn_pg->donor_pg_cookie;
+	cached_pg->donor_pg_cookie = refetch->main_pg_cookie;
+	//cached_pg->main_cookie = refetch->hdr.main_cookie;
+	cached_pg->donor_cookie = refetch->hdr.donor_cookie;
+
+	spin_lock(&hacky_spinlock);
+	xfer->hack		= ++hack;
+	xfer->cached_pg		= cached_pg;
+	xfer->target		= pg;
+	xfer->is_sync		= false;
+	xfer->is_main_node	= false;
+	xfer->donor_trprt	= donor_if;
+	xfer->return_info	= main_node->priv_return_info;
+	xfer->last_update	= ktime_get();
+	init_waitqueue_head(&xfer->waitq);
+	bitmap_zero(xfer->sent_bitmap, PAGE_SIZE);
+	bitmap_zero(xfer->received_bitmap, PAGE_SIZE);
+	xfer->retry_deadline	= ktime_add_ns(ktime_get(),
+					   REMOTE_NUMA_RETRY_INTERVAL_NS);
+	xfer->retry_count	= 0;
+	smp_wmb();
+	hash_add(xfer_table, &xfer->node,
+		 xfer_hash(refetch->donor_pg_cookie));
+	spin_unlock(&hacky_spinlock);
+
+	u16 seg_len = donor_if->get_max_payload_len() -
+		      sizeof(remote_numa_mem_pg_xfer_t);
+	remote_numa_send_all_segments(xfer, seg_len);
+
+	return remote_numa_receive_success;
 }
 
 remote_numa_send_ret_t remote_numa_transport_alloc_page_rcu(
@@ -430,6 +518,8 @@ remote_numa_send_ret_t remote_numa_transport_refetch_page(
 			break;
 		donor = NULL;
 	}
+if (!donor)
+	printk("no donor found for donor_node_id %llu\n", donor_node_id);
 	rcu_read_unlock();
 
 	if (!donor)
@@ -473,7 +563,9 @@ remote_numa_send_ret_t remote_numa_transport_refetch_page(
 	refetch->hdr.main_cookie   = donor->node_id;
 	refetch->hdr.donor_cookie  = donor->donor_cookie;
 	refetch->donor_pg_cookie   = donor_pg_cookie;
+	refetch->main_pg_cookie    = cached_target->main_pg_cookie;
 
+printk("now transmit\n");
 	if (trprt->tx_msg(trprt->trprt_ctx, donor->priv_return_info, tx_buf)) {
 		hash_del(&xfer->node);
 		kfree(xfer);
@@ -483,9 +575,10 @@ remote_numa_send_ret_t remote_numa_transport_refetch_page(
 	if (remote_numa_xfer_wait_complete(xfer, msecs_to_jiffies(REMOTE_NUMA_TRANSFER_TIMEOUT_MS))) {
 		hash_del(&xfer->node);
 		kfree(xfer);
+printk("send timeout\n");
 		return remote_numa_send_timeout;
 	}
-
+printk("should be good...\n");
 	hash_del(&xfer->node);
 	kfree(xfer);
 	return remote_numa_send_success;
@@ -495,7 +588,7 @@ remote_numa_receive_ret_t remote_numa_rx_mem_pg_sync_xfer(
 	remote_numa_donor_trprt_if_t *donor_if,
 	remote_numa_mem_pg_xfer_t *xfer)
 {
-	remote_numa_mem_mgr_t *mgr = donor_if->trprt_ctx->mem;
+	struct remote_numa_mem_mgr *mgr = donor_if->trprt_ctx->mem;
 	if (!mgr)
 		return remote_numa_receive_err_unknown;
 
@@ -503,7 +596,9 @@ remote_numa_receive_ret_t remote_numa_rx_mem_pg_sync_xfer(
 		return remote_numa_receive_out_of_bounds;
 
 	void *dst;
-	if (remote_numa_mem_lookup_page(mgr, xfer->receiver_pg_cookie, &dst) != 0)
+	remote_numa_page_t *rn_pg;
+	if (remote_numa_mem_lookup_page(mgr, xfer->receiver_pg_cookie,
+		&dst, &rn_pg) != 0)
 	{
 		return remote_numa_receive_bad_cookie;
 	}
@@ -652,7 +747,7 @@ printk("send timeout!!!\n");
 	return remote_numa_send_success;
 }
 
-remote_numa_trprt_ctx_t *remote_numa_make_trprt_ctx(remote_numa_mem_mgr_t *mem)
+remote_numa_trprt_ctx_t *remote_numa_make_trprt_ctx(struct remote_numa_mem_mgr *mem)
 {
 	remote_numa_trprt_ctx_t *ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx)
@@ -759,6 +854,9 @@ printk("payload=%px\n", payload);
 		goto done;
 	case remote_numa_mem_free:
 		ret = remote_numa_rx_mem_pg_free(donor_if, payload);
+		goto done;
+	case remote_numa_mem_refetch:
+		ret = remote_numa_rx_mem_pg_refetch(donor_if, payload);
 		goto done;
 	default:
 		ret = REMOTE_NUMA_TRPRT_RET(remote_numa_receive_mangled_pkt, 1);
@@ -885,7 +983,7 @@ remote_numa_receive_ret_t remote_numa_rx_mem_alloc(
 {
     u64 cookie;
     void *page;
-    remote_numa_mem_mgr_t *mgr = donor_if->trprt_ctx->mem;
+    struct remote_numa_mem_mgr *mgr = donor_if->trprt_ctx->mem;
 
     if (!mgr) {
         printk(KERN_DEBUG "No mem manager in donor.\n");

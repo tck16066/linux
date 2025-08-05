@@ -15,6 +15,7 @@
 #include <linux/errno.h>
 
 #include "memory.h"
+#include "client_cache.h"
 
 #define REMOTE_NUMA_POOL_SIZE 1024
 #define REMOTE_NUMA_COOKIE_HASH_BITS 14
@@ -60,9 +61,9 @@ static void clean_pool(mem_pool_t *pool)
 	kfree(pool);
 }
 
-remote_numa_mem_mgr_t *remote_numa_create_mem_mgr(size_t num_pages)
+struct remote_numa_mem_mgr *remote_numa_create_mem_mgr(size_t num_pages)
 {
-	remote_numa_mem_mgr_t *mgr = kzalloc(sizeof(*mgr), GFP_KERNEL);
+	struct remote_numa_mem_mgr *mgr = kzalloc(sizeof(*mgr), GFP_KERNEL);
 	if (!mgr)
 		return NULL;
 
@@ -119,7 +120,7 @@ fail:
 	return NULL;
 }
 
-void remote_numa_clean_mem_mgr(remote_numa_mem_mgr_t *mgr)
+void remote_numa_clean_mem_mgr(struct remote_numa_mem_mgr *mgr)
 {
 	if (!mgr)
 		return;
@@ -134,7 +135,7 @@ void remote_numa_clean_mem_mgr(remote_numa_mem_mgr_t *mgr)
 	kfree(mgr);
 }
 
-int remote_numa_mem_alloc_page(remote_numa_mem_mgr_t *mgr,
+int remote_numa_mem_alloc_page(struct remote_numa_mem_mgr *mgr,
                                u64 *cookie_out,
                                void **page_out)
 {
@@ -157,9 +158,10 @@ int remote_numa_mem_alloc_page(remote_numa_mem_mgr_t *mgr,
 	return 0;
 }
 
-int remote_numa_mem_lookup_page(remote_numa_mem_mgr_t *mgr,
+int remote_numa_mem_lookup_page(struct remote_numa_mem_mgr *mgr,
                                 u64 cookie,
-                                void **page_out)
+                                void **page_out,
+				remote_numa_page_t **rn_pg_out)
 {
 	u32 h = cookie_hash(cookie);
 	struct hlist_head *head = &mgr->cookie_table[h];
@@ -172,6 +174,7 @@ int remote_numa_mem_lookup_page(remote_numa_mem_mgr_t *mgr,
 		if (pg->donor_pg_cookie == cookie) {
 		spin_unlock_irqrestore(&mgr->lock, flags);
 			*page_out = pg->addr;
+			*rn_pg_out = pg;
 			return 0;
 		}
 	}
@@ -179,14 +182,15 @@ int remote_numa_mem_lookup_page(remote_numa_mem_mgr_t *mgr,
 	return -ENOENT;
 }
 
-int remote_numa_mem_sync_to_donor(remote_numa_mem_mgr_t *mgr,
+int remote_numa_mem_sync_to_donor(struct remote_numa_mem_mgr *mgr,
                                   u64 cookie,
                                   void *src_buf,
                                   size_t len,
                                   size_t offset)
 {
 	void *dst;
-	int ret = remote_numa_mem_lookup_page(mgr, cookie, &dst);
+	remote_numa_page_t *cached_pg;
+	int ret = remote_numa_mem_lookup_page(mgr, cookie, &dst, &cached_pg);
 	if (ret)
 		return ret;
 
@@ -197,13 +201,14 @@ int remote_numa_mem_sync_to_donor(remote_numa_mem_mgr_t *mgr,
 	return 0;
 }
 
-int remote_numa_mem_sync_from_donor(remote_numa_mem_mgr_t *mgr,
+int remote_numa_mem_sync_from_donor(struct remote_numa_mem_mgr *mgr,
                                     u64 cookie,
                                     void **src_buf_out,
                                     size_t *len_out)
 {
 	void *src;
-	int ret = remote_numa_mem_lookup_page(mgr, cookie, &src);
+	remote_numa_page_t *cached_pg;
+	int ret = remote_numa_mem_lookup_page(mgr, cookie, &src, &cached_pg);
 	if (ret)
 		return ret;
 
@@ -212,7 +217,7 @@ int remote_numa_mem_sync_from_donor(remote_numa_mem_mgr_t *mgr,
 	return 0;
 }
 
-int remote_numa_mem_free_page(remote_numa_mem_mgr_t *mgr,
+int remote_numa_mem_free_page(struct remote_numa_mem_mgr *mgr,
                               u64 cookie)
 {
 printk("remote_numa_mem_free_page  mgr  %px   cookie %llu\n",

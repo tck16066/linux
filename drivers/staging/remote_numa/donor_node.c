@@ -29,7 +29,7 @@
 
 static struct task_struct *kthread = NULL;
 static remote_numa_donor_trprt_if_t *ctx = NULL;
-static remote_numa_mem_mgr_t *mem;
+static struct remote_numa_mem_mgr *mem;
 
 static remote_numa_receive_ret_t rx_wrapper(void *frame)
 {

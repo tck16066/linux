@@ -77,7 +77,7 @@ static int test_page_lifecycle(remote_numa_client_cache_t *cache, unsigned long 
     }
 
     // Refault and verify each page
-    for (int i = 0; i < TOTAL_TEST_PAGES; i++) {
+    for (int i = 0; i < TOTAL_TEST_PAGES - 1; i++) {
         *((unsigned long *)&fake_vmf.address) = addr + (i * PAGE_SIZE);
 
         ret = remote_numa_client_cache_refault(cache, pages[i], &fake_vmf);

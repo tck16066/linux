@@ -14,7 +14,6 @@
 #include <linux/wait.h>
 
 #include "client_cache.h"
-#include "memory.h"
 #include "protocol.h"
 
 /* Create a return val for base + transport */
@@ -33,6 +32,7 @@
 
 struct remote_numa_cached_page;
 struct remote_numa_client_cache;
+struct remote_numa_mem_mgr;
 
 /*
  * Return status for sending messages. Transports encode their specific
@@ -81,7 +81,7 @@ typedef struct
 
 typedef struct
 {
-	remote_numa_mem_mgr_t *mem;
+	struct remote_numa_mem_mgr *mem;
 	DECLARE_HASHTABLE(node_table, REMOTE_NUMA_HASH_TABLE_ORDER);
 	void *trprt_ctx;
 	spinlock_t hash_write_lock;
@@ -127,7 +127,7 @@ typedef struct remote_numa_main_trprt_if
 	struct remote_numa_client_cache *client_cache;
 } remote_numa_main_trprt_if_t;
 
-remote_numa_trprt_ctx_t *remote_numa_make_trprt_ctx(remote_numa_mem_mgr_t *mem);
+remote_numa_trprt_ctx_t *remote_numa_make_trprt_ctx(struct remote_numa_mem_mgr *mem);
 
 void remote_numa_transport_ctx_destroy(remote_numa_trprt_ctx_t *ctx);
 
