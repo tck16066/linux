@@ -284,15 +284,8 @@ int remote_numa_client_cache_refault(remote_numa_client_cache_t *cache,
 	struct mm_struct *mm = vmf->vma->vm_mm;
 	unsigned long addr = vmf->address;
 
-	// theory/observation: it blows up on the 10th/10th refault
-	// from the caller. All of the calls currently fail with EIO
-	// except the last one, which crashes. This last entry won't
-	// actually be in the refault table because we never evicted
-	// it! So of course the lookup fails, and we crash.
 	struct refault_entry *rentry = refault_table_lookup(mm, addr);
-printk("here  %d\n", here++);
 	u64 donor_pg_cookie = rentry->donor_pg_cookie; //EXPLOSION HERE
-printk("there \n");
 	u32 donor_id = rentry->donor_id;
 	remote_numa_cached_page_t *entry = reuse_page(cache);
 

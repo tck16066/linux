@@ -196,6 +196,10 @@ remote_numa_send_ret_t remote_numa_tx_mem_pg_free(
 	u64 donor_pg_cookie,
 	uintptr_t main_pg_cookie);
 
+remote_numa_receive_ret_t remote_numa_rx_mem_pg_refetch_sat(
+    remote_numa_main_trprt_if_t *main_if,
+    remote_numa_mem_pg_xfer_t *sat);
+
 void tmp_init(void);
 
 #endif
