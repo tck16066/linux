@@ -35,8 +35,8 @@ enum remote_numa_protocol_version
 };
 
 typedef struct {
-	u16  version : 6;
-	u16  type : 10;
+	u8  version;
+	u8  type;
 	u16  reserved;
 	u32  main_cookie;
 	u32  donor_cookie;

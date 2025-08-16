@@ -91,10 +91,28 @@ static int test_page_lifecycle(remote_numa_client_cache_t *cache, unsigned long 
         unsigned char val = *(unsigned char *)kaddr;
         kunmap_local(kaddr);
 
+	bool valid = true;
+
+	u8 *dat = kaddr;
+	for (int j = 0; j < PAGE_SIZE; j++)
+	{
+		if (dat[j] != i)
+		{
+			valid = false;
+            		printk(KERN_ERR "[TEST] Refaulted page %d has incorrect data: %u\n", i, dat[j]);
+			break;
+		}
+	}
+
         if (val != i)
-            printk(KERN_ERR "[TEST] Refaulted page %d has incorrect data: %u\n", i, val);
-        else
+	{
+	    valid = false;
+            printk(KERN_ERR "[TEST] Refaulted page %d has incorrect page: %u\n", i, val);
+	}
+	if (valid)
             printk(KERN_INFO "[TEST] Refaulted page %d verified\n", i);
+        else
+            printk(KERN_INFO "[TEST] Refaulted page %d BAD verification\n", i);
     }
 
     printk(KERN_INFO "[TEST] Forcing eviction of first page\n");

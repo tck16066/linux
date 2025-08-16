@@ -74,7 +74,9 @@ static void free_rx_buff(void *buff)
 
 static custom_net_hook_ret_t eth_skb_handler(struct sk_buff *skb)
 {
-	if (skb->protocol != REMOTE_NUMA_ETHERTYPE)
+	const struct ethhdr *eh = skb_mac_header_was_set(skb) ? eth_hdr(skb) : NULL;
+
+	if (eh->h_proto != REMOTE_NUMA_ETHERTYPE)
 		return custom_net_hook_not_consumed;
 
 	if (remote_numa_submit_frame(skb)) {

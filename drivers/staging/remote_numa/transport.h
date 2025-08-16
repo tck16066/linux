@@ -200,6 +200,10 @@ remote_numa_receive_ret_t remote_numa_rx_mem_pg_refetch_sat(
     remote_numa_main_trprt_if_t *main_if,
     remote_numa_mem_pg_xfer_t *sat);
 
+remote_numa_receive_ret_t
+remote_numa_rx_mem_pg_refetch_ack(struct remote_numa_donor_trprt_if *donor_if,
+                                  remote_numa_mem_pg_xfer_ack_t *ack);
+
 void tmp_init(void);
 
 #endif
