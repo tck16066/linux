@@ -285,7 +285,7 @@ int remote_numa_client_cache_refault(remote_numa_client_cache_t *cache,
 	unsigned long addr = vmf->address;
 
 	struct refault_entry *rentry = refault_table_lookup(mm, addr);
-	u64 donor_pg_cookie = rentry->donor_pg_cookie; //EXPLOSION HERE
+	u64 donor_pg_cookie = rentry->donor_pg_cookie;
 	u32 donor_id = rentry->donor_id;
 	remote_numa_cached_page_t *entry = reuse_page(cache);
 

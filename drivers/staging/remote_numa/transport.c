@@ -452,6 +452,7 @@ remote_numa_send_ret_t remote_numa_transport_alloc_page_rcu(
 	struct page *target = cached_target->page;
 	main_xfer_state_t *xfer = kzalloc(sizeof(*xfer), GFP_KERNEL);
 	if (!xfer) {
+		spin_unlock(&hacky_spinlock);
 		printk(KERN_DEBUG "Could not alloc xfer state.\n");
 		return remote_numa_send_bad_alloc;
 	}
@@ -485,6 +486,7 @@ remote_numa_send_ret_t remote_numa_transport_alloc_page_rcu(
 	if (!tx_buf || !req) {
 		hash_del(&xfer->node);
 		kfree(xfer);
+		spin_unlock(&hacky_spinlock);
 		return remote_numa_send_bad_alloc;
 	}
 
