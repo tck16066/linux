@@ -18,6 +18,8 @@
 #include <linux/pid.h>
 #include <linux/mm_types.h>
 #include <linux/sched/mm.h> // for use_mm()
+#include <linux/err.h>
+#include <linux/delay.h>
 
 #include "client_cache.h"
 #include "transport.h"
@@ -64,11 +66,33 @@ static int test_page_lifecycle(remote_numa_client_cache_t *cache, unsigned long 
     for (int i = 0; i < TOTAL_TEST_PAGES; i++) {
         *((unsigned long *)&fake_vmf.address) = addr + (i * PAGE_SIZE);
 
-        pages[i] = remote_numa_client_cache_alloc(cache, &fake_vmf);
-        if (!pages[i]) {
-            printk(KERN_ERR "[TEST] Allocation %d failed\n", i);
-            return -ENOMEM;
+        int retry_count = 0;
+        const int max_retries = 10;
+        while (retry_count < max_retries) {
+            pages[i] = remote_numa_client_cache_alloc(cache, &fake_vmf);
+            if (IS_ERR(pages[i])) {
+                if (PTR_ERR(pages[i]) == -EAGAIN) {
+                    printk(KERN_INFO "[TEST] Allocation %d: transfer in progress, retrying (attempt %d)...\n",
+                           i, retry_count + 1);
+                    msleep(50); /* Brief delay before retry */
+                    retry_count++;
+                    continue;
+                } else {
+                    printk(KERN_ERR "[TEST] Allocation %d failed with error %ld\n", i, PTR_ERR(pages[i]));
+                    return PTR_ERR(pages[i]);
+                }
+            } else if (!pages[i]) {
+                printk(KERN_ERR "[TEST] Allocation %d failed\n", i);
+                return -ENOMEM;
+            }
+            break;
         }
+
+        if (retry_count >= max_retries) {
+            printk(KERN_ERR "[TEST] Allocation %d timed out after %d retries\n", i, max_retries);
+            return -ETIMEDOUT;
+        }
+
         printk(KERN_INFO "[TEST] Allocation %d succeeded\n", i);
 
         void *kaddr = kmap_local_page(pages[i]);
@@ -80,11 +104,30 @@ static int test_page_lifecycle(remote_numa_client_cache_t *cache, unsigned long 
     for (int i = 0; i < TOTAL_TEST_PAGES - 1; i++) {
         *((unsigned long *)&fake_vmf.address) = addr + (i * PAGE_SIZE);
 
-        ret = remote_numa_client_cache_refault(cache, pages[i], &fake_vmf);
-        if (ret) {
-            printk(KERN_ERR "[TEST] Refault %d failed with error %d\n", i, ret);
+        int retry_count = 0;
+        const int max_retries = 10;
+        while (retry_count < max_retries) {
+            ret = remote_numa_client_cache_refault(cache, pages[i], &fake_vmf);
+            if (ret == -EAGAIN) {
+                printk(KERN_INFO "[TEST] Refault %d: transfer in progress, retrying (attempt %d)...\n",
+                       i, retry_count + 1);
+                msleep(50); /* Brief delay before retry */
+                retry_count++;
+                continue;
+            } else if (ret) {
+                printk(KERN_ERR "[TEST] Refault %d failed with error %d\n", i, ret);
+                break;
+            }
+            break;
+        }
+
+        if (retry_count >= max_retries) {
+            printk(KERN_ERR "[TEST] Refault %d timed out after %d retries\n", i, max_retries);
             continue;
         }
+
+        if (ret)
+            continue;
 
         struct page *pg = pages[i];  // assume the pointer is valid again
         void *kaddr = kmap_local_page(pg);
@@ -120,7 +163,26 @@ static int test_page_lifecycle(remote_numa_client_cache_t *cache, unsigned long 
 
     printk(KERN_INFO "[TEST] Attempting to refault evicted page...\n");
     *((unsigned long *)&fake_vmf.address) = addr; // address for pages[0]
-    ret = remote_numa_client_cache_refault(cache, pages[0], &fake_vmf);
+    
+    int retry_count = 0;
+    const int max_retries = 10;
+    while (retry_count < max_retries) {
+        ret = remote_numa_client_cache_refault(cache, pages[0], &fake_vmf);
+        if (ret == -EAGAIN) {
+            printk(KERN_INFO "[TEST] Final refault: transfer in progress, retrying (attempt %d)...\n",
+                   retry_count + 1);
+            msleep(50);
+            retry_count++;
+            continue;
+        }
+        break;
+    }
+
+    if (retry_count >= max_retries) {
+        printk(KERN_ERR "[TEST] Final refault timed out after %d retries\n", max_retries);
+        return -ETIMEDOUT;
+    }
+
     if (ret)
         printk(KERN_ERR "[TEST] Refault failed with error %d\n", ret);
     else

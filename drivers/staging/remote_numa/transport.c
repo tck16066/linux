@@ -326,6 +326,15 @@ static void remote_numa_stop_retry_worker(void)
 	cancel_delayed_work_sync(&remote_numa_retry_work);
 }
 
+bool remote_numa_transport_is_transfer_complete(
+	struct remote_numa_cached_page *cached_target)
+{
+	main_xfer_state_t *xfer = xfer_lookup((uintptr_t)cached_target);
+	if (!xfer)
+		return true; /* No active transfer */
+	return xfer_compute_max_contig(xfer) >= PAGE_SIZE;
+}
+
 /* Pure lookup: caller must hold rcu_read_lock() */
 static remote_numa_node_t *__remote_numa_get_node(struct hlist_head *table,
 		       unsigned int table_bits,
@@ -442,7 +451,7 @@ printk("done and donen");
 	return remote_numa_receive_success;
 }
 
-remote_numa_send_ret_t remote_numa_transport_alloc_page_rcu(
+remote_numa_send_ret_t remote_numa_transport_alloc_page_async(
 	struct remote_numa_main_trprt_if *trprt,
 	remote_numa_node_t *donor,
 	struct remote_numa_cached_page *cached_target)
@@ -450,7 +459,7 @@ remote_numa_send_ret_t remote_numa_transport_alloc_page_rcu(
 	spin_lock(&hacky_spinlock);
 	u64 main_pg_cookie = (uintptr_t)cached_target;
 	struct page *target = cached_target->page;
-	main_xfer_state_t *xfer = kzalloc(sizeof(*xfer), GFP_KERNEL);
+	main_xfer_state_t *xfer = kzalloc(sizeof(*xfer), GFP_ATOMIC);
 	if (!xfer) {
 		spin_unlock(&hacky_spinlock);
 		printk(KERN_DEBUG "Could not alloc xfer state.\n");
@@ -504,6 +513,22 @@ remote_numa_send_ret_t remote_numa_transport_alloc_page_rcu(
 		return remote_numa_send_bad_xmit;
 	}
 
+	/* Return immediately - caller must check completion later */
+	return remote_numa_send_success;
+}
+
+remote_numa_send_ret_t remote_numa_transport_alloc_page_rcu(
+	struct remote_numa_main_trprt_if *trprt,
+	remote_numa_node_t *donor,
+	struct remote_numa_cached_page *cached_target)
+{
+	remote_numa_send_ret_t ret = remote_numa_transport_alloc_page_async(trprt, donor, cached_target);
+	if (ret != remote_numa_send_success)
+		return ret;
+
+	main_xfer_state_t *xfer = xfer_lookup((uintptr_t)cached_target);
+	if (!xfer)
+		return remote_numa_send_err_unknown;
 
 	if (remote_numa_xfer_wait_complete(xfer, (msecs_to_jiffies(REMOTE_NUMA_TRANSFER_TIMEOUT_MS)))) {
 		hash_del(&xfer->node);
@@ -511,17 +536,46 @@ remote_numa_send_ret_t remote_numa_transport_alloc_page_rcu(
 		printk(KERN_DEBUG "Timeout waiting for remote page allocation ack.\n");
 		return remote_numa_send_timeout;
 	}
-spin_lock(&hacky_spinlock);
 
-smp_rmb();
-	// On success, donor_pg_cookie should now be set in xfer->cached_pg
-spin_unlock(&hacky_spinlock);
 	hash_del(&xfer->node);
 	kfree(xfer);
 	return remote_numa_send_success;
 }
 
+/* Blocking version */
 remote_numa_send_ret_t remote_numa_transport_refetch_page(
+	struct remote_numa_main_trprt_if *trprt,
+	u32 donor_node_id,
+	u64 donor_pg_cookie,
+	struct remote_numa_cached_page *cached_target)
+{
+	remote_numa_send_ret_t ret = remote_numa_transport_refetch_page_async(
+		trprt, donor_node_id, donor_pg_cookie, cached_target);
+	if (ret != remote_numa_send_success)
+		return ret;
+
+	main_xfer_state_t *xfer = xfer_lookup((uintptr_t)cached_target);
+	if (!xfer)
+		return remote_numa_send_err_unknown;
+
+	if (remote_numa_xfer_wait_complete(xfer, msecs_to_jiffies(REMOTE_NUMA_TRANSFER_TIMEOUT_MS))) {
+		spin_lock(&hacky_spinlock);
+		hash_del(&xfer->node);
+		spin_unlock(&hacky_spinlock);
+		kfree(xfer);
+		printk("send timeout\n");
+		return remote_numa_send_timeout;
+	}
+	printk("should be good...\n");
+	spin_lock(&hacky_spinlock);
+	hash_del(&xfer->node);
+	spin_unlock(&hacky_spinlock);
+	kfree(xfer);
+	return remote_numa_send_success;
+}
+
+/* Non-blocking version */
+remote_numa_send_ret_t remote_numa_transport_refetch_page_async(
 	struct remote_numa_main_trprt_if *trprt,
 	u32 donor_node_id,
 	u64 donor_pg_cookie,
@@ -535,14 +589,14 @@ remote_numa_send_ret_t remote_numa_transport_refetch_page(
 			break;
 		donor = NULL;
 	}
-if (!donor)
-	printk("no donor found for donor_node_id %llu\n", donor_node_id);
+	if (!donor)
+		printk("no donor found for donor_node_id %llu\n", donor_node_id);
 	rcu_read_unlock();
 
 	if (!donor)
 		return remote_numa_send_no_if;
 
-	main_xfer_state_t *xfer = kzalloc(sizeof(*xfer), GFP_KERNEL);
+	main_xfer_state_t *xfer = kzalloc(sizeof(*xfer), GFP_ATOMIC);
 	if (!xfer)
 		return remote_numa_send_bad_alloc;
 
@@ -558,6 +612,7 @@ if (!donor)
 	xfer->return_info = donor->priv_return_info;
 	init_waitqueue_head(&xfer->waitq);
 	bitmap_zero(xfer->sent_bitmap, PAGE_SIZE);
+	bitmap_zero(xfer->received_bitmap, PAGE_SIZE);
 	xfer->retry_deadline = ktime_add_ns(ktime_get(), REMOTE_NUMA_RETRY_INTERVAL_NS);
 	xfer->retry_count = 0;
 
@@ -570,7 +625,9 @@ if (!donor)
 	void **v = (void **)&refetch;
 	trprt->alloc_tx_buffer(sizeof(*refetch), &tx_buf, v);
 	if (!tx_buf || !refetch) {
+		spin_lock(&hacky_spinlock);
 		hash_del(&xfer->node);
+		spin_unlock(&hacky_spinlock);
 		kfree(xfer);
 		return remote_numa_send_bad_alloc;
 	}
@@ -582,22 +639,16 @@ if (!donor)
 	refetch->donor_pg_cookie   = donor_pg_cookie;
 	refetch->main_pg_cookie    = cached_target->main_pg_cookie;
 
-printk("now transmit\n");
+	printk("now transmit\n");
 	if (trprt->tx_msg(trprt->trprt_ctx, donor->priv_return_info, tx_buf)) {
+		spin_lock(&hacky_spinlock);
 		hash_del(&xfer->node);
+		spin_unlock(&hacky_spinlock);
 		kfree(xfer);
 		return remote_numa_send_bad_xmit;
 	}
 
-	if (remote_numa_xfer_wait_complete(xfer, msecs_to_jiffies(REMOTE_NUMA_TRANSFER_TIMEOUT_MS))) {
-		hash_del(&xfer->node);
-		kfree(xfer);
-printk("send timeout\n");
-		return remote_numa_send_timeout;
-	}
-printk("should be good...\n");
-	hash_del(&xfer->node);
-	kfree(xfer);
+	/* Return immediately - caller polls for completion */
 	return remote_numa_send_success;
 }
 
@@ -708,7 +759,7 @@ if (ack->hack != xfer->hack)
 	return remote_numa_receive_success;
 }
 
-remote_numa_send_ret_t remote_numa_tx_mem_pg_sync_xfer(
+remote_numa_send_ret_t remote_numa_tx_mem_pg_sync_xfer_async(
 	struct remote_numa_main_trprt_if *main_if,
 	u64 donor_pg_cookie,
 	struct page *pg,
@@ -723,7 +774,7 @@ remote_numa_send_ret_t remote_numa_tx_mem_pg_sync_xfer(
 	if (!donor)
 		return remote_numa_send_no_if;
 
-	main_xfer_state_t *xfer = kzalloc(sizeof(*xfer), GFP_KERNEL);
+	main_xfer_state_t *xfer = kzalloc(sizeof(*xfer), GFP_ATOMIC);
 	if (!xfer)
 		return remote_numa_send_bad_alloc;
 
@@ -751,10 +802,29 @@ remote_numa_send_ret_t remote_numa_tx_mem_pg_sync_xfer(
 
 	remote_numa_send_all_segments(xfer, seg_len);
 
+	/* Return immediately - transfer will complete async */
+	return remote_numa_send_success;
+}
+
+remote_numa_send_ret_t remote_numa_tx_mem_pg_sync_xfer(
+	struct remote_numa_main_trprt_if *main_if,
+	u64 donor_pg_cookie,
+	struct page *pg,
+	struct remote_numa_cached_page *victim)
+{
+	remote_numa_send_ret_t ret = remote_numa_tx_mem_pg_sync_xfer_async(main_if,
+			donor_pg_cookie, pg, victim);
+	if (ret != remote_numa_send_success)
+		return ret;
+
+	main_xfer_state_t *xfer = xfer_lookup((uintptr_t)victim);
+	if (!xfer)
+		return remote_numa_send_err_unknown;
+
 	if (remote_numa_xfer_wait_complete(xfer, msecs_to_jiffies(REMOTE_NUMA_TRANSFER_TIMEOUT_MS))) {
 		hash_del(&xfer->node);
 		kfree(xfer);
-printk("send timeout!!!\n");
+		printk("send timeout!!!\n");
 		return remote_numa_send_timeout;
 	}
 
@@ -763,6 +833,29 @@ printk("send timeout!!!\n");
 	spin_unlock(&hacky_spinlock);
 	kfree(xfer);
 	return remote_numa_send_success;
+}
+
+/* Check if transfer is complete. Returns 0 if done, -EAGAIN if in progress, <0 on error */
+int remote_numa_check_transfer_complete(struct remote_numa_cached_page *cached_pg)
+{
+	main_xfer_state_t *xfer = xfer_lookup((uintptr_t)cached_pg);
+	if (!xfer) {
+		/* No transfer found - either never started or already completed */
+		return 0;
+	}
+
+	/* Check if transfer is complete */
+	if (xfer_compute_max_contig(xfer) >= PAGE_SIZE) {
+		/* Transfer complete - clean up */
+		spin_lock(&hacky_spinlock);
+		hash_del(&xfer->node);
+		spin_unlock(&hacky_spinlock);
+		kfree(xfer);
+		return 0;
+	}
+
+	/* Still in progress */
+	return -EAGAIN;
 }
 
 remote_numa_trprt_ctx_t *remote_numa_make_trprt_ctx(struct remote_numa_mem_mgr *mem)
@@ -1274,7 +1367,11 @@ EXPORT_SYMBOL_GPL(tmp_init);
 
 
 EXPORT_SYMBOL_GPL(remote_numa_transport_alloc_page_rcu);
+EXPORT_SYMBOL_GPL(remote_numa_transport_alloc_page_async);
 EXPORT_SYMBOL_GPL(remote_numa_transport_refetch_page);
+EXPORT_SYMBOL_GPL(remote_numa_transport_refetch_page_async);
+EXPORT_SYMBOL_GPL(remote_numa_tx_mem_pg_sync_xfer_async);
+EXPORT_SYMBOL_GPL(remote_numa_transport_is_transfer_complete);
 EXPORT_SYMBOL_GPL(remote_numa_rx_mem_pg_sat_ack);
 EXPORT_SYMBOL_GPL(remote_numa_rx_mem_pg_sync_ack);
 EXPORT_SYMBOL_GPL(remote_numa_rx_mem_alloc);
