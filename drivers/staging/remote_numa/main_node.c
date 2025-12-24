@@ -22,7 +22,7 @@
 
 #define WORKER_POOL_SIZE 4
 //#define REMOTE_NUMA_MAX_CACHED_PGS 128000
-#define REMOTE_NUMA_MAX_CACHED_PGS 2
+#define REMOTE_NUMA_MAX_CACHED_PGS 1200
 
 remote_numa_main_trprt_if_t *ctx = NULL;
 remote_numa_client_cache_t *client_cache = NULL;

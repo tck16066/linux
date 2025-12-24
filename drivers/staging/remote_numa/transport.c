@@ -55,6 +55,12 @@ typedef struct main_xfer_state {
 	void *return_info;
 } main_xfer_state_t;
 
+struct retry_work_item {
+	main_xfer_state_t *xfer;
+	u16 seg_len;
+	struct list_head list;
+};
+
 static void alloc_tx_buffer(main_xfer_state_t *xfer,
 	size_t payload_len, void **obj, void**payload_start)
 {
@@ -137,37 +143,33 @@ static inline u32 xfer_hash(u64 cookie)
 	return hash_64(cookie, REMOTE_NUMA_XFER_HASH_BITS);
 }
 
-static void dump_xfer_table(void)
+static void xfer_free(main_xfer_state_t *xfer)
 {
-    main_xfer_state_t *xfer;
-    int bkt;
-
-    pr_info("=== Dumping xfer_table ===\n");
-    hash_for_each(xfer_table, bkt, xfer, node) {
-        pr_info("  bucket %d: cached:%llu  main_pg_cookie=%llu, donor_pg_cookie=%llx\n",
-                bkt,
-                (uintptr_t)xfer->cached_pg,
-		xfer->cached_pg->main_pg_cookie,
-                xfer->cached_pg->donor_pg_cookie);
-    }
+	struct remote_numa_cached_page *cached = xfer->cached_pg;
+	
+	// Free cached_pg if it was allocated for mem_free tracking
+	if (xfer->transfer_type == remote_numa_mem_free && cached)
+		kfree(cached);
+	
+	kfree(xfer);
 }
-
 
 static main_xfer_state_t *xfer_lookup(u64 cookie)
 {
-spin_lock(&hacky_spinlock);
+	spin_lock(&hacky_spinlock);
 	main_xfer_state_t *xfer;
-printk("search %llu %llu \n", (uintptr_t)cookie,  xfer_hash(cookie));
 	hash_for_each_possible(xfer_table, xfer, node, xfer_hash(cookie)) {
+		if (!xfer->cached_pg) {
+			continue;
+		}
 		if (((uintptr_t)cookie) == (uintptr_t)xfer->cached_pg->main_pg_cookie)
 		{
-printk("found\n");
-spin_unlock(&hacky_spinlock);
+			spin_unlock(&hacky_spinlock);
 			return xfer;
 		}
 	}
 
-spin_unlock(&hacky_spinlock);
+	spin_unlock(&hacky_spinlock);
 	return NULL;
 }
 
@@ -239,7 +241,6 @@ static int remote_numa_send_segment(main_xfer_state_t *xfer, u32 offset, u16 seg
 	msg->hdr.type = xfer->transfer_type;
 	msg->hdr.main_cookie = xfer->cached_pg->donor_id;
 	msg->hdr.donor_cookie = xfer->cached_pg->donor_cookie;
-printk("donor cookie send   %llu\n", msg->hdr.main_cookie);
 	msg->flags = (offset + payload_len >= PAGE_SIZE) ? remote_numa_xfer_end_of_pg : 0;
 	msg->seq_num = offset;
 	msg->payload_len = payload_len;
@@ -270,16 +271,30 @@ static void remote_numa_retry_xfers(struct work_struct *work)
 	main_xfer_state_t *xfer;
 	struct hlist_node *tmp;
 	int bkt;
+	LIST_HEAD(work_list);
+	main_xfer_state_t **cleanup_array = NULL;
+	int cleanup_count = 0;
+	int cleanup_capacity = 16;
+
+	/* Use an array to store pointers to completed transfers to minimize lock hold time */
+	cleanup_array = kmalloc(cleanup_capacity * sizeof(*cleanup_array), GFP_KERNEL);
+	if (!cleanup_array) {
+		schedule_delayed_work(&remote_numa_retry_work,
+			msecs_to_jiffies(REMOTE_NUMA_RETRY_INTERVAL_MS));
+		return;
+	}
 
 	spin_lock(&hacky_spinlock);
 	hash_for_each_safe(xfer_table, bkt, tmp, xfer, node) {
 		if (xfer->is_main_node)
-			continue; // Let main node manage its own cleanup
+			continue;
 
 		if (xfer_compute_max_contig(xfer) >= PAGE_SIZE) {
-			// Transfer complete – clean it up
 			hash_del(&xfer->node);
-			kfree(xfer);
+			if (cleanup_count < cleanup_capacity)
+				cleanup_array[cleanup_count++] = xfer;
+			else /* Out of space in cleanup array, need to free now. */
+				xfer_free(xfer);
 			continue;
 		}
 
@@ -289,20 +304,18 @@ static void remote_numa_retry_xfers(struct work_struct *work)
 		if (xfer->retry_count >= REMOTE_NUMA_MAX_RETRY_COUNT) {
 			printk(KERN_WARNING "remote_numa: donor xfer timeout\n");
 			hash_del(&xfer->node);
-			kfree(xfer);
+			if (cleanup_count < cleanup_capacity)
+				cleanup_array[cleanup_count++] = xfer;
+			else
+				xfer_free(xfer);
 			continue;
 		}
 
-		u16 max_payload = xfer_state_max_payload(xfer);
-		u16 seg_len = max_payload - sizeof(remote_numa_mem_pg_xfer_t);
-
-		for (u32 offset = 0; offset < PAGE_SIZE; offset += seg_len) {
-			if (!test_bit(offset / seg_len, xfer->sent_bitmap))
-				continue;
-			if (test_bit(offset, xfer->received_bitmap))
-				continue;
-
-			remote_numa_send_segment(xfer, offset, seg_len);
+		struct retry_work_item *item = kmalloc(sizeof(*item), GFP_ATOMIC);
+		if (item) {
+			item->xfer = xfer;
+			item->seg_len = xfer_state_max_payload(xfer) - sizeof(remote_numa_mem_pg_xfer_t);
+			list_add(&item->list, &work_list);
 		}
 
 		xfer->retry_count++;
@@ -310,6 +323,24 @@ static void remote_numa_retry_xfers(struct work_struct *work)
 			REMOTE_NUMA_REXMIT_CHECK_MS * NSEC_PER_MSEC);
 	}
 	spin_unlock(&hacky_spinlock);
+
+	struct retry_work_item *item, *item_tmp;
+	list_for_each_entry_safe(item, item_tmp, &work_list, list) {
+		for (u32 offset = 0; offset < PAGE_SIZE; offset += item->seg_len) {
+			if (!test_bit(offset / item->seg_len, item->xfer->sent_bitmap))
+				continue;
+			if (test_bit(offset, item->xfer->received_bitmap))
+				continue;
+
+			remote_numa_send_segment(item->xfer, offset, item->seg_len);
+		}
+		list_del(&item->list);
+		kfree(item);
+	}
+
+	for (int i = 0; i < cleanup_count; i++)
+		xfer_free(cleanup_array[i]);
+	kfree(cleanup_array);
 
 	schedule_delayed_work(&remote_numa_retry_work,
 		msecs_to_jiffies(REMOTE_NUMA_RETRY_INTERVAL_MS));
@@ -374,7 +405,6 @@ static remote_numa_receive_ret_t remote_numa_rx_mem_pg_refetch(
 	struct remote_numa_donor_trprt_if *donor_if,
 	remote_numa_mem_refetch_t *refetch)
 {
-printk("rx refetch\n");
 	struct remote_numa_mem_mgr *mgr = donor_if->trprt_ctx->mem;
 	if (!mgr)
 		return remote_numa_receive_err_unknown;
@@ -385,16 +415,14 @@ printk("rx refetch\n");
 	if (remote_numa_mem_lookup_page(mgr, refetch->donor_pg_cookie,
 	                                 &page_ptr, &rn_pg) != 0)
 	{
-printk("bad donor pg cookie lookup\n");
 		return remote_numa_receive_bad_cookie;
 	}
 	cached_pg = &rn_pg->cached_pg;
 
-printk("now lookup page\n");
 	struct page *pg = virt_to_page(page_ptr);
 	if (!pg)
 	{
-printk("bad page lookup\n");
+printk("bad  lookup\n");
 		return remote_numa_receive_err_unknown;
 	}
 
@@ -404,7 +432,6 @@ printk("bad page lookup\n");
 		refetch->hdr.donor_cookie);
 	if (!main_node)
 	{
-printk("did not find main node %llu\n", refetch->hdr.donor_cookie);
 		return remote_numa_receive_err_unknown;
 	}
 
@@ -418,7 +445,6 @@ printk("did not find main node %llu\n", refetch->hdr.donor_cookie);
 	
 	cached_pg->main_pg_cookie = rn_pg->donor_pg_cookie;
 	cached_pg->donor_pg_cookie = refetch->main_pg_cookie;
-printk("intended main cookie %llu\n", refetch->hdr.main_cookie);
 	cached_pg->donor_id = refetch->hdr.main_cookie; //gross. broke an abstraction.
 	cached_pg->donor_cookie = refetch->hdr.donor_cookie;
 
@@ -444,10 +470,8 @@ printk("intended main cookie %llu\n", refetch->hdr.main_cookie);
 
 	u16 seg_len = donor_if->get_max_payload_len() -
 		      sizeof(remote_numa_mem_pg_xfer_t);
-printk("send all selgs\n");
 	remote_numa_send_all_segments(xfer, seg_len);
 
-printk("done and donen");
 	return remote_numa_receive_success;
 }
 
@@ -485,7 +509,6 @@ remote_numa_send_ret_t remote_numa_transport_alloc_page_async(
 
 	hash_add(xfer_table, &xfer->node, xfer_hash(main_pg_cookie));
 
-	// Build and send remote_numa_mem_alloc_t
 	void *tx_buf;
 	remote_numa_mem_alloc_t *req;
 	void **v = (void **)&req;
@@ -494,7 +517,7 @@ remote_numa_send_ret_t remote_numa_transport_alloc_page_async(
 	trprt->alloc_tx_buffer(sizeof(*req), &tx_buf, v);
 	if (!tx_buf || !req) {
 		hash_del(&xfer->node);
-		kfree(xfer);
+		xfer_free(xfer);
 		spin_unlock(&hacky_spinlock);
 		return remote_numa_send_bad_alloc;
 	}
@@ -509,7 +532,7 @@ remote_numa_send_ret_t remote_numa_transport_alloc_page_async(
 	spin_unlock(&hacky_spinlock);
 	if (trprt->tx_msg(trprt->trprt_ctx, donor->priv_return_info, tx_buf)) {
 		hash_del(&xfer->node);
-		kfree(xfer);
+		xfer_free(xfer);
 		return remote_numa_send_bad_xmit;
 	}
 
@@ -532,13 +555,13 @@ remote_numa_send_ret_t remote_numa_transport_alloc_page_rcu(
 
 	if (remote_numa_xfer_wait_complete(xfer, (msecs_to_jiffies(REMOTE_NUMA_TRANSFER_TIMEOUT_MS)))) {
 		hash_del(&xfer->node);
-		kfree(xfer);
+		xfer_free(xfer);
 		printk(KERN_DEBUG "Timeout waiting for remote page allocation ack.\n");
 		return remote_numa_send_timeout;
 	}
 
 	hash_del(&xfer->node);
-	kfree(xfer);
+	xfer_free(xfer);
 	return remote_numa_send_success;
 }
 
@@ -562,15 +585,14 @@ remote_numa_send_ret_t remote_numa_transport_refetch_page(
 		spin_lock(&hacky_spinlock);
 		hash_del(&xfer->node);
 		spin_unlock(&hacky_spinlock);
-		kfree(xfer);
-		printk("send timeout\n");
+		xfer_free(xfer);
+		printk(KERN_WARNING "send timeout waiting for remote page refetch.\n");
 		return remote_numa_send_timeout;
 	}
-	printk("should be good...\n");
 	spin_lock(&hacky_spinlock);
 	hash_del(&xfer->node);
 	spin_unlock(&hacky_spinlock);
-	kfree(xfer);
+	xfer_free(xfer);
 	return remote_numa_send_success;
 }
 
@@ -590,7 +612,7 @@ remote_numa_send_ret_t remote_numa_transport_refetch_page_async(
 		donor = NULL;
 	}
 	if (!donor)
-		printk("no donor found for donor_node_id %llu\n", donor_node_id);
+		printk("no donor found for donor_node_id %u\n", donor_node_id);
 	rcu_read_unlock();
 
 	if (!donor)
@@ -619,7 +641,6 @@ remote_numa_send_ret_t remote_numa_transport_refetch_page_async(
 	smp_wmb();
 	hash_add_rcu(xfer_table, &xfer->node, xfer_hash((uintptr_t)cached_target));
 
-	// Build and send refetch request
 	void *tx_buf;
 	remote_numa_mem_refetch_t *refetch;
 	void **v = (void **)&refetch;
@@ -628,7 +649,7 @@ remote_numa_send_ret_t remote_numa_transport_refetch_page_async(
 		spin_lock(&hacky_spinlock);
 		hash_del(&xfer->node);
 		spin_unlock(&hacky_spinlock);
-		kfree(xfer);
+		xfer_free(xfer);
 		return remote_numa_send_bad_alloc;
 	}
 
@@ -639,12 +660,11 @@ remote_numa_send_ret_t remote_numa_transport_refetch_page_async(
 	refetch->donor_pg_cookie   = donor_pg_cookie;
 	refetch->main_pg_cookie    = cached_target->main_pg_cookie;
 
-	printk("now transmit\n");
 	if (trprt->tx_msg(trprt->trprt_ctx, donor->priv_return_info, tx_buf)) {
 		spin_lock(&hacky_spinlock);
 		hash_del(&xfer->node);
 		spin_unlock(&hacky_spinlock);
-		kfree(xfer);
+		xfer_free(xfer);
 		return remote_numa_send_bad_xmit;
 	}
 
@@ -706,12 +726,6 @@ remote_numa_receive_ret_t remote_numa_rx_mem_pg_sync_xfer(
 	return ret;
 }
 
-// XXX sat_ack is not being satisfied for eviction cases due to
-// bad cookie.
-// and yet we seem to think that the call is completed.
-// this implies that the bitmap test isn't working.
-// also, the root cause of the cookie issue may be
-// due to nad rcu semantics.
 remote_numa_receive_ret_t remote_numa_rx_mem_pg_sat_ack(
 	struct remote_numa_main_trprt_if *main_if,
 	remote_numa_mem_satisfaction_t *ack)
@@ -719,18 +733,17 @@ remote_numa_receive_ret_t remote_numa_rx_mem_pg_sat_ack(
 	main_xfer_state_t *xfer = xfer_lookup(ack->main_pg_cookie);
 	if (!xfer || ack->hack != hack)
 	{
-printk("BAD COOKIE    %llu   hack? %d\n", ack->main_pg_cookie, ack->hack == hack);
 		return remote_numa_receive_bad_cookie;
 	}
 
 	// small hack here to signify "done."
-spin_lock(&hacky_spinlock);
+	spin_lock(&hacky_spinlock);
 	bitmap_fill(xfer->received_bitmap, PAGE_SIZE);
 
 	xfer->cached_pg->donor_pg_cookie = ack->donor_pg_cookie;
 	smp_wmb();
 	wake_up(&xfer->waitq);
-spin_unlock(&hacky_spinlock);
+	spin_unlock(&hacky_spinlock);
 	return remote_numa_receive_success;
 }
 
@@ -740,14 +753,8 @@ remote_numa_receive_ret_t remote_numa_rx_mem_pg_sync_ack(
 {
 	main_xfer_state_t *xfer = xfer_lookup(ack->receiver_pg_cookie);
 
-if(!xfer) printk("bad lookup, man.\n");
 	if (!xfer)
 		return remote_numa_receive_bad_cookie;
-
-if (ack->hack != xfer->hack)
-{
-	printk("ignoring msg due to hack staleness\n");
-}
 
 	bitmap_set(xfer->received_bitmap, ack->bottom_seq_num,
 		ack->top_seq_num - ack->bottom_seq_num);
@@ -823,15 +830,14 @@ remote_numa_send_ret_t remote_numa_tx_mem_pg_sync_xfer(
 
 	if (remote_numa_xfer_wait_complete(xfer, msecs_to_jiffies(REMOTE_NUMA_TRANSFER_TIMEOUT_MS))) {
 		hash_del(&xfer->node);
-		kfree(xfer);
-		printk("send timeout!!!\n");
+		xfer_free(xfer);
 		return remote_numa_send_timeout;
 	}
 
 	spin_lock(&hacky_spinlock);
 	hash_del(&xfer->node);
 	spin_unlock(&hacky_spinlock);
-	kfree(xfer);
+	xfer_free(xfer);
 	return remote_numa_send_success;
 }
 
@@ -850,7 +856,7 @@ int remote_numa_check_transfer_complete(struct remote_numa_cached_page *cached_p
 		spin_lock(&hacky_spinlock);
 		hash_del(&xfer->node);
 		spin_unlock(&hacky_spinlock);
-		kfree(xfer);
+		xfer_free(xfer);
 		return 0;
 	}
 
@@ -1216,11 +1222,21 @@ remote_numa_send_ret_t remote_numa_tx_mem_pg_free(
 	if (!donor)
 		return remote_numa_send_no_if;
 
-	// Prepare xfer tracking for ACK
 	main_xfer_state_t *xfer = kzalloc(sizeof(*xfer), GFP_KERNEL);
 	if (!xfer)
 		return remote_numa_send_bad_alloc;
 
+	/* Create a minimal cached_pg for hash table lookup consistency */
+	struct remote_numa_cached_page *cached_pg = kzalloc(sizeof(*cached_pg), GFP_KERNEL);
+	if (!cached_pg) {
+		xfer_free(xfer);
+		return remote_numa_send_bad_alloc;
+	}
+	cached_pg->main_pg_cookie = main_pg_cookie;
+	cached_pg->donor_pg_cookie = donor_pg_cookie;
+	cached_pg->donor_id = donor_id;
+
+	xfer->cached_pg = cached_pg;
 	xfer->target = NULL;  // no local page, just waiting for ack
 	xfer->transfer_type = remote_numa_mem_free;
 	xfer->main_trprt = main_if;
@@ -1241,7 +1257,7 @@ remote_numa_send_ret_t remote_numa_tx_mem_pg_free(
 	main_if->alloc_tx_buffer(sizeof(*msg), &tx_buf, v);
 	if (!tx_buf || !msg) {
 		hash_del(&xfer->node);
-		kfree(xfer);
+		xfer_free(xfer);
 		return remote_numa_send_bad_alloc;
 	}
 
@@ -1254,13 +1270,13 @@ remote_numa_send_ret_t remote_numa_tx_mem_pg_free(
 
 	if (main_if->tx_msg(main_if->trprt_ctx, donor->priv_return_info, tx_buf)) {
 		hash_del(&xfer->node);
-		kfree(xfer);
+		xfer_free(xfer);
 		return remote_numa_send_bad_xmit;
 	}
 	// Wait for ACK
 	if (remote_numa_xfer_wait_complete(xfer, msecs_to_jiffies(REMOTE_NUMA_TRANSFER_TIMEOUT_MS))) {
 		hash_del(&xfer->node);
-		kfree(xfer);
+		xfer_free(xfer);
 		return remote_numa_send_timeout;
 	}
 
@@ -1268,7 +1284,7 @@ remote_numa_send_ret_t remote_numa_tx_mem_pg_free(
 	spin_lock(&hacky_spinlock);
 	hash_del(&xfer->node);
 	spin_unlock(&hacky_spinlock);
-	kfree(xfer);
+	xfer_free(xfer);
 	return remote_numa_send_success;
 }
 
@@ -1276,27 +1292,21 @@ remote_numa_receive_ret_t remote_numa_rx_mem_pg_refetch_sat(
     remote_numa_main_trprt_if_t *main_if,
     remote_numa_mem_pg_xfer_t *sat)
 {
-printk("refetch sat %px  \n", sat);
     main_xfer_state_t *xfer = xfer_lookup(sat->receiver_pg_cookie);
     if (!xfer)
     {
-printk("bad lookup   %llu\n", sat->receiver_pg_cookie);
 	return remote_numa_receive_bad_cookie;
     }
-printk("we found!\n");
     if (sat->payload_len + sat->seq_num > PAGE_SIZE)
         return remote_numa_receive_out_of_bounds;
 
-printk("now copy\n");
     /* write segment into local page */
     void *dst = page_address(xfer->target);
     memcpy(dst + sat->seq_num, ((u8 *)sat) + sizeof(*sat), sat->payload_len);
 
-printk("done copy\n");
     /* mark locally received so waiters can complete */
     bitmap_set(xfer->received_bitmap, sat->seq_num, sat->payload_len);
 
-printk("bitmap set\n");
     /* build ACK with bottom/top = [seq, seq+len), like sync */
     void *ack_buf;
     remote_numa_mem_pg_xfer_ack_t *ack;
@@ -1319,10 +1329,16 @@ printk("bitmap set\n");
         REMOTE_NUMA_HASH_TABLE_ORDER,
         sat->hdr.main_cookie);
 
-printk("donor is %px   from cookie  %llu\n", donor, sat->hdr.main_cookie);
+    if (!donor) {
+        printk(KERN_ERR "refetch_sat: failed to find donor node %u\n", sat->hdr.main_cookie);
+        return remote_numa_receive_bad_cookie;
+    }
 
     /* send ACK back to donor */
-    (void)main_if->tx_msg(main_if->trprt_ctx, donor->priv_return_info, ack_buf);
+    int ret = main_if->tx_msg(main_if->trprt_ctx, donor->priv_return_info, ack_buf);
+    if (ret) {
+        printk(KERN_ERR "refetch_sat: failed to send ACK, ret=%d\n", ret);
+    }
 
     /* done? wake any waiters */
     if (xfer_compute_max_contig(xfer) >= PAGE_SIZE)
@@ -1340,11 +1356,11 @@ remote_numa_rx_mem_pg_refetch_ack(struct remote_numa_donor_trprt_if *donor_if,
         return remote_numa_receive_bad_cookie;
 
     /* Stale in-flight? Keep behavior consistent with sync_ack: log and continue. */
-    if (ack->hack != xfer->hack)
-	{
-		return 1; // XXX
-            printk("ignoring msg due to hack staleness\n");
-	}
+    if (ack->hack != xfer->hack) {
+        printk("ignoring refetch_ack due to hack staleness (expected %d, got %d)\n",
+               xfer->hack, ack->hack);
+        return remote_numa_receive_success;  // Silently ignore stale acks
+    }
 
     /* Range-based ACK: handle out-of-order arrivals without over-marking. */
     bitmap_set(xfer->received_bitmap,

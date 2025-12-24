@@ -70,14 +70,9 @@ refault_table_lookup(struct mm_struct *mm, unsigned long addr)
 	struct refault_entry *entry;
 	u32 key = refault_hash_key(mm, addr);
 
-
-int bkt;
-
-printk("dummpit\n");
 	hash_for_each_possible(refault_table, entry, node, key) {
 		if (entry->mm == mm && entry->addr == addr)
 			return entry;
-		printk("mm  %px  entry addr  %llu\n", entry->mm, entry->addr);
 	}
 	return NULL;
 }
@@ -136,13 +131,11 @@ evict_victim:
 	 * The transfer flag will prevent this page from being used or evicted again
 	 * until the background retry worker completes and cleans it up.
 	 */
-	printk("start eviction sync (async)\n");
 	ret = remote_numa_tx_mem_pg_sync_xfer_async(cache->trprt,
 					victim->donor_pg_cookie,
 					victim->page,
 					victim);
 	if (ret != 0) {
-		printk("sync xfer async initiation failed\n");
 		/* Put it back and clear flag */
 		atomic_set(&victim->transfer_in_progress, 0);
 		spin_lock(&cache->lock);
@@ -170,7 +163,6 @@ evict_victim:
 		schedule_delayed_work(&cache->eviction_completion_work, msecs_to_jiffies(10));
 	}
 	
-	printk("eviction transfer initiated\n");
 	/* Return -EAGAIN to indicate eviction is in progress, caller should retry */
 	return -EAGAIN;
 }
@@ -229,7 +221,6 @@ static void eviction_completion_worker(struct work_struct *work)
 			if (vma && victim->addr >= vma->vm_start &&
 				victim->addr < vma->vm_end) {
 				zap_page_range_single(vma, victim->addr, PAGE_SIZE, NULL);
-				printk("insert cookie into refault  %llu\\n", victim->donor_pg_cookie);
 				refault_table_insert(victim->mm, victim->addr,
 						     victim->donor_pg_cookie,
 						     victim->donor_id);
@@ -487,6 +478,7 @@ int remote_numa_client_cache_free_page(remote_numa_client_cache_t *cache,
 	u32 donor_id;
 	u64 donor_pg_cookie;
 	uintptr_t main_pg_cookie;
+	bool found = false;
 
 	spin_lock(&cache->lock);
 	hash_for_each_possible(cache->page_lookup, entry, node, (uintptr_t)page) {
@@ -499,20 +491,26 @@ int remote_numa_client_cache_free_page(remote_numa_client_cache_t *cache,
 			donor_id = entry->donor_id;
 			donor_pg_cookie = entry->donor_pg_cookie;
 			main_pg_cookie = (uintptr_t)entry;
-			
-			list_add(&entry->lru_list, &cache->free_list);
-			spin_unlock(&cache->lock);
-			
-			/* Do the blocking remote free call without holding spinlock */
-			remote_numa_tx_mem_pg_free(cache->trprt,
-				donor_id,
-				donor_pg_cookie,
-				main_pg_cookie);
-			return 0;
+			found = true;
+			break;
 		}
 	}
 	spin_unlock(&cache->lock);
-	return -ENOENT;
+	
+	if (!found)
+		return -ENOENT;
+	
+	/* Do the blocking remote free call without holding any locks */
+	remote_numa_tx_mem_pg_free(cache->trprt,
+		donor_id,
+		donor_pg_cookie,
+		main_pg_cookie);
+	
+	/* Only add to free list after remote free completes */
+	spin_lock(&cache->lock);
+	list_add(&entry->lru_list, &cache->free_list);
+	spin_unlock(&cache->lock);
+	return 0;
 }
 
 EXPORT_SYMBOL_GPL(remote_numa_client_cache_init);
