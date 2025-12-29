@@ -177,21 +177,9 @@ int remote_numa_check_transfer_complete(struct remote_numa_cached_page *cached_p
 bool remote_numa_transport_is_transfer_complete(
 	struct remote_numa_cached_page *cached_target);
 
-remote_numa_send_ret_t remote_numa_tx_mem_pg_sync_xfer_async(
-	remote_numa_main_trprt_if_t *main_if,
-	u64 donor_pg_cookie,
-	struct page *pg,
-	struct remote_numa_cached_page *victim);
-
 remote_numa_receive_ret_t remote_numa_rx_mem_pg_sat_ack(
 	remote_numa_main_trprt_if_t *main_if,
 	remote_numa_mem_satisfaction_t *ack);
-
-remote_numa_send_ret_t remote_numa_tx_mem_pg_sync_xfer(
-	remote_numa_main_trprt_if_t *main_if,
-	u64 donor_pg_cookie,
-	struct page * pg,
-	struct remote_numa_cached_page *victim);
 
 remote_numa_receive_ret_t remote_numa_rx_mem_pg_sync_xfer(
 	remote_numa_donor_trprt_if_t *donor_if,

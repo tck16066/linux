@@ -763,37 +763,6 @@ remote_numa_send_ret_t remote_numa_tx_mem_pg_sync_xfer_async(
 	return remote_numa_send_success;
 }
 
-remote_numa_send_ret_t remote_numa_tx_mem_pg_sync_xfer(
-	struct remote_numa_main_trprt_if *main_if,
-	u64 donor_pg_cookie,
-	struct page *pg,
-	struct remote_numa_cached_page *victim)
-{
-	remote_numa_send_ret_t ret = remote_numa_tx_mem_pg_sync_xfer_async(main_if,
-			donor_pg_cookie, pg, victim);
-	if (ret != remote_numa_send_success)
-		return ret;
-
-	main_xfer_state_t *xfer = xfer_lookup((uintptr_t)victim);
-	if (!xfer)
-		return remote_numa_send_err_unknown;
-
-	if (remote_numa_xfer_wait_complete(xfer, msecs_to_jiffies(REMOTE_NUMA_TRANSFER_TIMEOUT_MS))) {
-		 u64 cookie = xfer->cached_pg ? xfer->cached_pg->main_pg_cookie : (uintptr_t)victim;
-		 printk(KERN_WARNING "tx_mem_pg_free: hash_del xfer (timeout), cookie=%llu, hash=%u, xfer=%p\n",
-			 (unsigned long long)cookie, xfer_hash(cookie), xfer);
-		 hash_del(&xfer->node);
-		 xfer_free(xfer);
-		 return remote_numa_send_timeout;
-	}
-
-	spin_lock(&hacky_spinlock);
-	hash_del(&xfer->node);
-	spin_unlock(&hacky_spinlock);
-	xfer_free(xfer);
-	return remote_numa_send_success;
-}
-
 /* Check if transfer is complete. Returns 0 if done, -EAGAIN if in progress, <0 on error */
 int remote_numa_check_transfer_complete(struct remote_numa_cached_page *cached_pg)
 {
@@ -1352,7 +1321,6 @@ EXPORT_SYMBOL_GPL(tmp_init);
 
 EXPORT_SYMBOL_GPL(remote_numa_transport_alloc_page_async);
 EXPORT_SYMBOL_GPL(remote_numa_transport_refetch_page_async);
-EXPORT_SYMBOL_GPL(remote_numa_tx_mem_pg_sync_xfer_async);
 EXPORT_SYMBOL_GPL(remote_numa_transport_is_transfer_complete);
 EXPORT_SYMBOL_GPL(remote_numa_rx_mem_pg_sat_ack);
 EXPORT_SYMBOL_GPL(remote_numa_rx_mem_pg_sync_ack);
