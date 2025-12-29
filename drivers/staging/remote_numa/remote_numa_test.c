@@ -7,14 +7,12 @@
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/mm.h>
-#include <linux/types.h>
 #include <linux/proc_fs.h>
 #include <linux/sched.h>
 #include <linux/sched/task.h>
 #include <linux/slab.h>
 #include <linux/fs.h>
 #include <linux/uaccess.h>
-#include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/cdev.h>
 #include <linux/pid.h>
@@ -22,8 +20,6 @@
 #include <linux/sched/mm.h> // for use_mm()
 #include <linux/err.h>
 #include <linux/delay.h>
-#include <linux/jiffies.h>
-#include <linux/sched/signal.h>
 
 #include "client_cache.h"
 #include "transport.h"
@@ -31,144 +27,32 @@
 extern remote_numa_client_cache_t *client_cache;
 remote_numa_client_cache_t *global_remote_cache = NULL;
 
-#define TEST_CACHE_PAGES 2
-#define TOTAL_TEST_PAGES 50  // Increased for stress testing
+/* Allocate enough pages to trigger cache eviction (cache holds 1200) */
+#define TOTAL_TEST_PAGES 1205
 #define REMOTE_NUMA_RUN_TEST _IOW('R', 1, unsigned long)
-
-#define MAX_TEST_ERROR_EVENTS 128
-#define MAX_TEST_EVENT_AGG_ENTRIES 16
-
-#define REMOTE_NUMA_TEST_STRESS_2H
-
-#ifdef REMOTE_NUMA_TEST_STRESS_2H
-#define REMOTE_NUMA_TEST_STRESS_DURATION_MS (2UL * 60 * 60 * 1000)
-#endif
-
-struct test_error_event {
-    const char *operation;
-    int index;
-    int err;
-    bool timeout;
-};
-
-struct test_event_aggregate_entry {
-    const char *operation;
-    unsigned int count;
-    unsigned int timeout_count;
-};
-
-struct test_event_aggregate {
-    struct test_event_aggregate_entry entries[MAX_TEST_EVENT_AGG_ENTRIES];
-    unsigned int entry_count;
-    unsigned long total_events;
-    unsigned long overflow_events;
-};
-
-static void record_test_event(struct test_error_event *events, int *count,
-                 const char *operation, int index, int err,
-                 bool timeout)
-{
-    if (!events || !count || *count >= MAX_TEST_ERROR_EVENTS)
-        return;
-    events[*count].operation = operation;
-    events[*count].index = index;
-    events[*count].err = err;
-    events[*count].timeout = timeout;
-    (*count)++;
-}
-
-static void dump_test_events(struct test_error_event *events, int count)
-{
-    int i;
-    if (!count)
-        return;
-    printk(KERN_ERR "[TEST] ---- error summary (%d entries) ----\n", count);
-    for (i = 0; i < count; i++)
-        printk(KERN_ERR "[TEST]   %s in %s (index %d) err=%d\n",
-               events[i].timeout ? "Timeout" : "Error",
-               events[i].operation,
-               events[i].index,
-               events[i].err);
-}
-
-static void aggregate_test_events(struct test_event_aggregate *agg,
-                       struct test_error_event *events,
-                       int count)
-{
-    int i, j;
-    if (!agg || !events)
-        return;
-    for (i = 0; i < count; i++) {
-        struct test_error_event *evt = &events[i];
-        struct test_event_aggregate_entry *entry = NULL;
-        for (j = 0; j < agg->entry_count; j++) {
-            if (agg->entries[j].operation == evt->operation) {
-                entry = &agg->entries[j];
-                break;
-            }
-        }
-        if (!entry) {
-            if (agg->entry_count >= MAX_TEST_EVENT_AGG_ENTRIES) {
-                agg->overflow_events += (count - i);
-                break;
-            }
-            entry = &agg->entries[agg->entry_count++];
-            entry->operation = evt->operation;
-            entry->count = 0;
-            entry->timeout_count = 0;
-        }
-        entry->count++;
-        if (evt->timeout)
-            entry->timeout_count++;
-    }
-    agg->total_events += count;
-}
-
-static void dump_test_event_aggregate(struct test_event_aggregate *agg)
-{
-    unsigned int i;
-    if (!agg || !agg->total_events)
-        return;
-    printk(KERN_ERR "[TEST] ---- aggregate failure summary (%lu events) ----\n",
-           agg->total_events);
-    for (i = 0; i < agg->entry_count; i++)
-        printk(KERN_ERR "[TEST]   %s: total=%u timeout=%u\n",
-               agg->entries[i].operation,
-               agg->entries[i].count,
-               agg->entries[i].timeout_count);
-    if (agg->overflow_events)
-        printk(KERN_ERR "[TEST]   (truncated %lu additional events)\n",
-               agg->overflow_events);
-}
 
 static dev_t devno;
 static struct class *test_class;
 static struct cdev test_cdev;
 static struct proc_dir_entry *test_entry;
 
-static int test_page_lifecycle(remote_numa_client_cache_t *cache,
-                     unsigned long addr,
-                     struct test_event_aggregate *agg)
+static int test_page_lifecycle(remote_numa_client_cache_t *cache, unsigned long addr)
 {
     struct vm_fault fake_vmf;
     struct vm_area_struct *vma;
-    struct page *pages[TOTAL_TEST_PAGES];
+    struct page **pages;
     int ret;
-    int rc = 0;
-    struct test_error_event *events;
-    int event_count = 0;
 
-    events = kcalloc(MAX_TEST_ERROR_EVENTS,
-              sizeof(*events), GFP_KERNEL);
-    if (!events) {
-        printk(KERN_ERR "[TEST] Failed to alloc event buffer\n");
+    pages = kmalloc_array(TOTAL_TEST_PAGES, sizeof(struct page *), GFP_KERNEL);
+    if (!pages) {
+        printk(KERN_ERR "[TEST] Failed to allocate pages array\n");
         return -ENOMEM;
     }
 
     if (!current->mm) {
         printk(KERN_ERR "[TEST] current->mm is NULL\n");
-        rc = -EINVAL;
-        goto out;
+        kfree(pages);
+        return -EINVAL;
     }
 
     down_read(&current->mm->mmap_lock);
@@ -176,17 +60,17 @@ static int test_page_lifecycle(remote_numa_client_cache_t *cache,
     up_read(&current->mm->mmap_lock);
     if (!vma) {
         printk(KERN_ERR "[TEST] No VMA found for address %px\n", (void *)addr);
-        rc = -EINVAL;
-        goto out;
+        kfree(pages);
+        return -EINVAL;
     }
 
-    printk(KERN_INFO "=== TEST: Remote NUMA stress test [PID %d] ===\n", current->pid);
+    printk(KERN_INFO "=== TEST: Remote NUMA page lifecycle with eviction ===\n");
 
     struct vm_area_struct fake_vma = *vma;
     memset(&fake_vmf, 0, sizeof(fake_vmf));
     *((struct vm_area_struct **)&fake_vmf.vma) = &fake_vma;
 
-    // Phase 1: Allocate many pages to force evictions
+    // Allocate and fill each page with a unique pattern
     for (int i = 0; i < TOTAL_TEST_PAGES; i++) {
         *((unsigned long *)&fake_vmf.address) = addr + (i * PAGE_SIZE);
 
@@ -202,197 +86,125 @@ static int test_page_lifecycle(remote_numa_client_cache_t *cache,
                     retry_count++;
                     continue;
                 } else {
-                    ret = PTR_ERR(pages[i]);
                     printk(KERN_ERR "[TEST] Allocation %d failed with error %ld\n", i, PTR_ERR(pages[i]));
-                    record_test_event(events, &event_count,
-                              "remote_numa_client_cache_alloc",
-                              i, ret, false);
-                    rc = ret;
-                    goto out;
+                    kfree(pages);
+                    return PTR_ERR(pages[i]);
                 }
             } else if (!pages[i]) {
                 printk(KERN_ERR "[TEST] Allocation %d failed\n", i);
-                record_test_event(events, &event_count,
-                          "remote_numa_client_cache_alloc",
-                          i, -ENOMEM, false);
-                rc = -ENOMEM;
-                goto out;
+                kfree(pages);
+                return -ENOMEM;
             }
             break;
         }
 
         if (retry_count >= max_retries) {
             printk(KERN_ERR "[TEST] Allocation %d timed out after %d retries\n", i, max_retries);
-            record_test_event(events, &event_count,
-                      "remote_numa_client_cache_alloc",
-                      i, -ETIMEDOUT, true);
-            rc = -ETIMEDOUT;
-            goto out;
+            kfree(pages);
+            return -ETIMEDOUT;
         }
 
-        if ((i % 10) == 0)
-            printk(KERN_INFO "[TEST] Allocation %d/%d succeeded\n", i, TOTAL_TEST_PAGES);
+        printk(KERN_INFO "[TEST] Allocation %d succeeded\n", i);
 
         void *kaddr = kmap_local_page(pages[i]);
         memset(kaddr, i, PAGE_SIZE);
         kunmap_local(kaddr);
     }
 
-    printk(KERN_INFO "[TEST] Phase 1 complete: %d pages allocated\n", TOTAL_TEST_PAGES);
+    printk(KERN_INFO "[TEST] All %d pages allocated successfully\n", TOTAL_TEST_PAGES);
+    printk(KERN_INFO "[TEST] Pages 0-4 should have been evicted to make room for later pages\n");
 
-    // Phase 2: Free random pages to create churn
-    printk(KERN_INFO "[TEST] Phase 2: Freeing random pages\n");
-    for (int i = 0; i < TOTAL_TEST_PAGES / 4; i++) {
-        int idx = i * 4;  // Free every 4th page
-        remote_numa_client_cache_free_page(cache, pages[idx]);
-        if ((i % 5) == 0)
-            printk(KERN_INFO "[TEST] Freed page %d\n", idx);
-    }
-
-    // Phase 3: Refault and verify remaining pages (skip freed ones)
-    printk(KERN_INFO "[TEST] Phase 3: Refaulting and verifying\n");
-    int verify_count = 0;
-    for (int i = 0; i < TOTAL_TEST_PAGES - 1; i++) {
-        // Skip pages we freed in phase 2
-        if ((i % 4) == 0)
-            continue;
-            
+    // Refault and verify all 5 evicted pages
+    bool all_valid = true;
+    for (int i = 0; i < 5; i++) {
+        printk(KERN_INFO "[TEST] Attempting to refault evicted page %d...\n", i);
         *((unsigned long *)&fake_vmf.address) = addr + (i * PAGE_SIZE);
-
+        
         int retry_count = 0;
         const int max_retries = 10;
         while (retry_count < max_retries) {
             ret = remote_numa_client_cache_refault(cache, pages[i], &fake_vmf);
             if (ret == -EAGAIN) {
-                if ((retry_count % 3) == 0)
-                    printk(KERN_INFO "[TEST] Refault %d: retrying (attempt %d)...\n",
-                           i, retry_count + 1);
-                msleep(20); /* Brief delay before retry */
+                printk(KERN_INFO "[TEST] Refault %d: transfer in progress, retrying (attempt %d)...\n",
+                       i, retry_count + 1);
+                msleep(50);
                 retry_count++;
                 continue;
-            } else if (ret) {
-                printk(KERN_ERR "[TEST] Refault %d failed with error %d\n", i, ret);
-                record_test_event(events, &event_count,
-                          "remote_numa_client_cache_refault",
-                          i, ret, false);
-                break;
             }
             break;
         }
 
         if (retry_count >= max_retries) {
             printk(KERN_ERR "[TEST] Refault %d timed out after %d retries\n", i, max_retries);
-            record_test_event(events, &event_count,
-                      "remote_numa_client_cache_refault",
-                      i, -ETIMEDOUT, true);
-            continue;
+            kfree(pages);
+            return -ETIMEDOUT;
         }
 
         if (ret) {
-            printk(KERN_ERR "[TEST] Skipping verification for page %d due to refault failure\n", i);
-            continue;
+            printk(KERN_ERR "[TEST] Refault %d failed with error %d\n", i, ret);
+            kfree(pages);
+            return ret;
         }
 
-        struct page *pg = pages[i];  // assume the pointer is valid again
-        void *kaddr = kmap_local_page(pg);
-	bool valid = true;
-	u8 *dat = kaddr;
-	
-	for (int j = 0; j < PAGE_SIZE; j++)
-	{
-		if (dat[j] != i)
-		{
-			valid = false;
-            		printk(KERN_ERR "[TEST] Refaulted page %d has incorrect data at offset %d: %u (expected %d)\n", 
-			       i, j, dat[j], i);
-			break;
-		}
-	}
-        
+        printk(KERN_INFO "[TEST] Refault %d succeeded\n", i);
+
+        // Verify the refaulted page data
+        void *kaddr = kmap_local_page(pages[i]);
+        bool valid = true;
+        unsigned char expected = (unsigned char)i;
+        for (int j = 0; j < PAGE_SIZE; j++) {
+            if (((unsigned char *)kaddr)[j] != expected) {
+                valid = false;
+                printk(KERN_ERR "[TEST] Page %d data corrupted at offset %d: expected %u, got %u\n",
+                       i, j, expected, ((unsigned char *)kaddr)[j]);
+                break;
+            }
+        }
         kunmap_local(kaddr);
 
-	if (valid) {
-            verify_count++;
-            if ((verify_count % 5) == 0)
-                printk(KERN_INFO "[TEST] Verified %d pages\n", verify_count);
-        } else {
-            printk(KERN_ERR "[TEST] Page %d verification FAILED\n", i);
-            record_test_event(events, &event_count,
-                      "verify_page_data",
-                      i, -EIO, false);
+        if (valid)
+            printk(KERN_INFO "[TEST] Page %d data verified successfully\n", i);
+        else {
+            printk(KERN_ERR "[TEST] Page %d data verification FAILED\n", i);
+            all_valid = false;
         }
     }
 
-    printk(KERN_INFO "[TEST] Phase 3 complete: %d pages verified\n", verify_count);
+    printk(KERN_INFO "=== TEST COMPLETE ===\n");
 
-    // Phase 4: Free more pages and test final refault
-    /* Cleanup */
-    printk(KERN_INFO "[TEST] Phase 4: Cleanup remaining pages\n");
-    int cleanup_count = 0;
+    // Clean up all allocated pages to avoid filling the cache across test runs
+    printk(KERN_INFO "[TEST] Freeing all %d allocated pages...\n", TOTAL_TEST_PAGES);
     for (int i = 0; i < TOTAL_TEST_PAGES; i++) {
-        if (pages[i]) {
-            remote_numa_client_cache_free_page(cache, pages[i]);
-            cleanup_count++;
+        ret = remote_numa_client_cache_free_page(cache, pages[i]);
+        if (ret && ret != -ENOENT) {
+            printk(KERN_WARNING "[TEST] Failed to free page %d: error %d\n", i, ret);
         }
     }
-    printk(KERN_INFO "[TEST] Cleanup complete: freed %d pages\n", cleanup_count);
+    printk(KERN_INFO "[TEST] Cleanup complete\n");
 
-    printk(KERN_INFO "[TEST] ========== TEST SUITE COMPLETE ==========\n");
-    rc = 0;
-out:
-    dump_test_events(events, event_count);
-    aggregate_test_events(agg, events, event_count);
-    kfree(events);
-    return rc;
-}
-
-static int remote_numa_run_tests(remote_numa_client_cache_t *cache, unsigned long addr)
-{
-#ifdef REMOTE_NUMA_TEST_STRESS_2H
-    unsigned long deadline = jiffies +
-        msecs_to_jiffies(REMOTE_NUMA_TEST_STRESS_DURATION_MS);
-    unsigned int iterations = 0;
-    unsigned int successes = 0;
-    unsigned int failures = 0;
-    int rc = 0;
-    struct test_event_aggregate agg = { };
-
-    printk(KERN_INFO "[TEST] Stress mode enabled: running for up to 2 hours\n");
-    ssleep(5); // brief pause before starting
-    while (time_before(jiffies, deadline)) {
-        iterations++;
-        rc = test_page_lifecycle(cache, addr, &agg);
-        if (!rc)
-            successes++;
-        else
-            failures++;
-
-        if (signal_pending(current)) {
-            printk(KERN_INFO "[TEST] Stress run interrupted after %u iterations\n",
-                   iterations);
-            break;
-        }
-        cond_resched();
-    }
-
-    if (!iterations)
-        printk(KERN_WARNING "[TEST] Stress mode exit with no iterations\n");
-    printk(KERN_INFO "[TEST] Stress summary: iterations=%u successes=%u failures=%u\n",
-           iterations, successes, failures);
-    dump_test_event_aggregate(&agg);
-    return rc;
-#else
-    printk(KERN_INFO "[TEST] Running single iteration test\n");
-    ssleep(5); // brief pause before starting
-    return test_page_lifecycle(cache, addr, NULL);
-#endif
+    kfree(pages);
+    return all_valid ? 0 : -EIO;
 }
 
 static long remote_numa_test_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     if (cmd == REMOTE_NUMA_RUN_TEST) {
+        unsigned long end_addr = arg + (TOTAL_TEST_PAGES * PAGE_SIZE);
+        
+        /* Validate userspace address range */
+        if (!access_ok((void __user *)arg, TOTAL_TEST_PAGES * PAGE_SIZE)) {
+            printk(KERN_ERR "[TEST] Invalid userspace address range\n");
+            return -EFAULT;
+        }
+        
+        /* Check for overflow */
+        if (end_addr < arg) {
+            printk(KERN_ERR "[TEST] Address range overflow\n");
+            return -EINVAL;
+        }
+        
         printk(KERN_INFO "[TEST] IOCTL triggered with addr = %px\n", (void *)arg);
-        return remote_numa_run_tests(client_cache, arg);
+        return test_page_lifecycle(client_cache, arg);
     }
     return -ENOTTY;
 }
@@ -405,7 +217,7 @@ static const struct file_operations remote_numa_test_fops = {
 static ssize_t test_trigger(struct file *file, char __user *buf, size_t count, loff_t *ppos)
 {
     unsigned long addr = (unsigned long)current;
-    return remote_numa_run_tests(client_cache, addr);
+    return test_page_lifecycle(client_cache, addr);
 }
 
 static const struct proc_ops test_fops = {

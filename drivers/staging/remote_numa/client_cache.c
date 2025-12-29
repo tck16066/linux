@@ -14,7 +14,7 @@
 #include "client_cache.h"
 #include "transport.h"
 
-#define REMOTE_NUMA_REFAULT_HASH_BITS 10
+#define REMOTE_NUMA_REFAULT_HASH_BITS 12
 
 /* assumes lock is held */
 static remote_numa_node_t *choose_donor(remote_numa_client_cache_t *cache)
@@ -66,7 +66,6 @@ static void refault_table_insert(struct mm_struct *mm, unsigned long addr,
 static struct refault_entry*
 refault_table_lookup(struct mm_struct *mm, unsigned long addr)
 {
-
 	struct refault_entry *entry;
 	u32 key = refault_hash_key(mm, addr);
 
@@ -213,13 +212,12 @@ static void eviction_completion_worker(struct work_struct *work)
 		}
 		
 		/* Transfer complete or error - do final cleanup */
-		bool do_zap = victim->mm && victim->addr;
-		if (do_zap && status == 0) {
+		if (status == 0 && victim->mm && victim->addr) {
 			struct vm_area_struct *vma;
 			mmap_write_lock(victim->mm);
 			vma = find_vma(victim->mm, victim->addr);
 			if (vma && victim->addr >= vma->vm_start &&
-				victim->addr < vma->vm_end) {
+			    victim->addr < vma->vm_end) {
 				zap_page_range_single(vma, victim->addr, PAGE_SIZE, NULL);
 				refault_table_insert(victim->mm, victim->addr,
 						     victim->donor_pg_cookie,
@@ -227,9 +225,16 @@ static void eviction_completion_worker(struct work_struct *work)
 			}
 			mmap_write_unlock(victim->mm);
 		}
-
+		
 		/* Clear transfer flag and move to free list */
 		atomic_set(&victim->transfer_in_progress, 0);
+		
+		/* Drop mm reference before moving to free list */
+		if (victim->mm) {
+			mmdrop(victim->mm);
+			victim->mm = NULL;
+		}
+		
 		spin_lock(&cache->lock);
 		list_del(&victim->lru_list);
 		list_add(&victim->lru_list, &cache->free_list);
@@ -288,17 +293,21 @@ void remote_numa_client_cache_destroy(remote_numa_client_cache_t *cache)
 
 	list_for_each_safe(pos, tmp, &cache->lru_head) {
 		entry = list_entry(pos, remote_numa_cached_page_t, lru_list);
-		mmdrop(entry->mm);
 		list_del(pos);
 		hash_del(&entry->node);
 		__free_page(entry->page);
+		if (entry->mm) {
+			mmdrop(entry->mm);
+		}
 		kfree(entry);
 	}
 	list_for_each_safe(pos, tmp, &cache->free_list) {
 		entry = list_entry(pos, remote_numa_cached_page_t, lru_list);
-		mmdrop(entry->mm);
 		list_del(pos);
 		__free_page(entry->page);
+		if (entry->mm) {
+			mmdrop(entry->mm);
+		}
 		kfree(entry);
 	}
 	cache->current_cached_pages = 0;
@@ -363,7 +372,7 @@ struct page *remote_numa_client_cache_alloc(remote_numa_client_cache_t *cache,
 	entry->donor_id = donor->node_id;
 	entry->donor_cookie = donor->donor_cookie;
 	entry->mm = vmf->vma->vm_mm;
-	mmgrab(entry->mm);
+	mmgrab(entry->mm);  /* Hold ref - eviction will zap PTE asynchronously */
 	entry->addr = vmf->address;
 
 	if (need_rcu_unlock && took_rcu_lock)
@@ -450,6 +459,7 @@ int remote_numa_client_cache_refault(remote_numa_client_cache_t *cache,
 	entry->donor_pg_cookie = donor_pg_cookie;
 	entry->donor_id = donor_id;
 	entry->mm = vmf->vma->vm_mm;
+	mmgrab(entry->mm);  /* Hold ref - eviction will zap PTE asynchronously */
 	entry->addr = vmf->address;
 
 	/* Initiate async refetch - returns immediately */
@@ -480,12 +490,21 @@ int remote_numa_client_cache_free_page(remote_numa_client_cache_t *cache,
 	uintptr_t main_pg_cookie;
 	bool found = false;
 
+	/*
+	 * XXX: when we refault, we are removing pages from the cache. This causes
+	 * us to forget that they ever existed, which means that in the best case
+	 * the donors will leak. To fix this, we need to keep track of every page
+	 * we've ever known about so that "cached" means "hot in the cache" and
+	 * in-the-known-list means "cache miss" (requires refault) and
+	 * not-in-the-known-list means "error."
+	 */
+
 	spin_lock(&cache->lock);
 	hash_for_each_possible(cache->page_lookup, entry, node, (uintptr_t)page) {
 		if (entry->page == page) {
 			list_del(&entry->lru_list);
 			cache->current_cached_pages--;
-			hash_del(&entry->node);  // Remove from hash
+			hash_del(&entry->node);
 			
 			/* Save info we need for remote free */
 			donor_id = entry->donor_id;
@@ -495,17 +514,32 @@ int remote_numa_client_cache_free_page(remote_numa_client_cache_t *cache,
 			break;
 		}
 	}
+
 	spin_unlock(&cache->lock);
-	
 	if (!found)
+	{
+		printk(KERN_WARNING "No entry found for free.");
 		return -ENOENT;
+	}
 	
-	/* Do the blocking remote free call without holding any locks */
+	/* Do the blocking remote free call without holding any locks.
+	 * We cannot do much about an error. We can leak, or the donor
+	 * can leak. We would rather the donor leak, because we have
+	 * a smaller number of pages locally (in the cache).
+	 * 
+	 * TODO: Add retry logic async, and do all of the freeing async.
+	 */
 	remote_numa_tx_mem_pg_free(cache->trprt,
 		donor_id,
 		donor_pg_cookie,
 		main_pg_cookie);
 	
+	/* Drop mm reference before moving to free list */
+	if (entry->mm) {
+		mmdrop(entry->mm);
+		entry->mm = NULL;
+	}
+
 	/* Only add to free list after remote free completes */
 	spin_lock(&cache->lock);
 	list_add(&entry->lru_list, &cache->free_list);

@@ -123,13 +123,13 @@ typedef struct
 typedef struct
 {
 	remote_numa_msg_hdr_t hdr;
-	u32 donor_pg_cookie;
-	u32 main_pg_cookie;
+	u64 donor_pg_cookie;
+	u64 main_pg_cookie;
 } __attribute__((__packed__)) remote_numa_mem_free_t;
 
 typedef struct
 {
 	remote_numa_msg_hdr_t hdr;
-	u32 main_pg_cookie;
+	u64 main_pg_cookie;
 } __attribute__((__packed__)) remote_numa_mem_free_ack_t;
 #endif

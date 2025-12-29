@@ -220,8 +220,6 @@ int remote_numa_mem_sync_from_donor(struct remote_numa_mem_mgr *mgr,
 int remote_numa_mem_free_page(struct remote_numa_mem_mgr *mgr,
                               u64 cookie)
 {
-printk("remote_numa_mem_free_page  mgr  %px   cookie %llu\n",
-	mgr, cookie);
 	u32 h = cookie_hash(cookie);
 	struct hlist_head *head = &mgr->cookie_table[h];
 	remote_numa_page_t *pg;
