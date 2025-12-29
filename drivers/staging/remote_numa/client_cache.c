@@ -12,7 +12,56 @@
 #include <linux/workqueue.h>
 
 #include "client_cache.h"
+
 #include "transport.h"
+
+struct remote_numa_pg_free_work {
+	struct work_struct work;
+	remote_numa_main_trprt_if_t *trprt;
+	u32 donor_id;
+	u64 donor_pg_cookie;
+	uintptr_t main_pg_cookie;
+};
+
+static void remote_numa_pg_free_workfn(struct work_struct *work)
+{
+	struct remote_numa_pg_free_work *w =
+		container_of(work, struct remote_numa_pg_free_work, work);
+	/*
+	 * Do the blocking remote free call in worker context.
+	 * We cannot do much about an error. We can leak, or the donor
+	 * can leak. We would rather the donor leak, because we have
+	 * a smaller number of pages locally (in the cache).
+	 * 
+	 * Note that it is preferable to follow the existing model of how async works
+	 * with the other functions where the EAGAIN is passed up to the caller,
+	 * for two reasons. Firstly, consistency. Secondly, it makes the caller handle
+	 * back-pressure rather than stacking it up silently. This hacky
+	 * approach is quicker for now.
+	 */
+	remote_numa_tx_mem_pg_free(w->trprt, w->donor_id, w->donor_pg_cookie, w->main_pg_cookie);
+	kfree(w);
+}
+
+static void remote_numa_tx_mem_pg_free_async(remote_numa_main_trprt_if_t *trprt,
+											 u32 donor_id,
+											 u64 donor_pg_cookie,
+											 uintptr_t main_pg_cookie)
+{
+	struct remote_numa_pg_free_work *w =
+		kmalloc(sizeof(*w), GFP_ATOMIC);
+	if (!w) {
+		/* fallback: leak or warn */
+		WARN_ON_ONCE(1);
+		return;
+	}
+	INIT_WORK(&w->work, remote_numa_pg_free_workfn);
+	w->trprt = trprt;
+	w->donor_id = donor_id;
+	w->donor_pg_cookie = donor_pg_cookie;
+	w->main_pg_cookie = main_pg_cookie;
+	queue_work(system_unbound_wq, &w->work);
+}
 
 #define REMOTE_NUMA_REFAULT_HASH_BITS 12
 
@@ -521,8 +570,9 @@ int remote_numa_client_cache_refault(remote_numa_client_cache_t *cache,
 	return -EAGAIN;
 }
 
+
 int remote_numa_client_cache_free_page(remote_numa_client_cache_t *cache,
-				       struct page *page)
+									   struct page *page)
 {
 	remote_numa_cached_page_t *entry = NULL;
 	u32 donor_id;
@@ -545,7 +595,6 @@ int remote_numa_client_cache_free_page(remote_numa_client_cache_t *cache,
 			list_del(&entry->lru_list);
 			cache->current_cached_pages--;
 			hash_del(&entry->node);
-			
 			/* Save info we need for remote free */
 			donor_id = entry->known_page->donor_id;
 			donor_pg_cookie = entry->known_page->donor_pg_cookie;
@@ -554,33 +603,25 @@ int remote_numa_client_cache_free_page(remote_numa_client_cache_t *cache,
 			break;
 		}
 	}
-
 	spin_unlock(&cache->lock);
-	if (!found)
-	{
+	if (!found) {
 		printk(KERN_WARNING "No entry found for free.");
 		return -ENOENT;
 	}
-	
-	/* Do the blocking remote free call without holding any locks.
-	 * We cannot do much about an error. We can leak, or the donor
-	 * can leak. We would rather the donor leak, because we have
-	 * a smaller number of pages locally (in the cache).
-	 * 
-	 * TODO: Add retry logic async, and do all of the freeing async.
-	 */
-	remote_numa_tx_mem_pg_free(cache->trprt,
+
+	/* Async remote free: schedule work to do the remote free in process context. */
+	remote_numa_tx_mem_pg_free_async(cache->trprt,
 		donor_id,
 		donor_pg_cookie,
 		main_pg_cookie);
-	
+
 	/* Drop mm reference before moving to free list */
 	if (entry->mm) {
 		defer_mmdrop(entry->mm); /* mmdrop is not safe to call while atomic. */
 		entry->mm = NULL;
 	}
 
-	/* Only add to free list after remote free completes */
+	/* Add to free list immediately; remote free will complete in background. */
 	spin_lock(&cache->lock);
 	list_add(&entry->lru_list, &cache->free_list);
 	spin_unlock(&cache->lock);
