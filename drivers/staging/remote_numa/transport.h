@@ -153,22 +153,6 @@ remote_numa_receive_ret_t remote_numa_rx_mem_alloc(
 	remote_numa_donor_trprt_if_t *donor_if,
 	remote_numa_mem_alloc_t *alloc);
 
-remote_numa_send_ret_t remote_numa_transport_alloc_page_rcu(
-	remote_numa_main_trprt_if_t *trprt,
-	remote_numa_node_t *donor,
-	struct remote_numa_cached_page *cached_target);
-
-remote_numa_send_ret_t remote_numa_transport_alloc_page_rcu(
-	remote_numa_main_trprt_if_t *trprt,
-	remote_numa_node_t *donor,
-	struct remote_numa_cached_page *cached_target);
-
-remote_numa_send_ret_t remote_numa_transport_refetch_page(
-	remote_numa_main_trprt_if_t *trprt,
-	u32 donor_node_id,
-	u64 donor_pg_cookie,
-	struct remote_numa_cached_page *cached_target);
-
 /* Non-blocking variants - return immediately, use _check_transfer_complete to poll */
 remote_numa_send_ret_t remote_numa_transport_alloc_page_async(
 	remote_numa_main_trprt_if_t *trprt,
@@ -189,12 +173,6 @@ remote_numa_send_ret_t remote_numa_tx_mem_pg_sync_xfer_async(
 
 /* Check if async transfer is complete. Returns 0 if complete, -EAGAIN if still in progress, <0 on error */
 int remote_numa_check_transfer_complete(struct remote_numa_cached_page *cached_pg);
-
-remote_numa_send_ret_t remote_numa_transport_refetch_page_async(
-	remote_numa_main_trprt_if_t *trprt,
-	u32 donor_node_id,
-	u64 donor_pg_cookie,
-	struct remote_numa_cached_page *cached_target);
 
 bool remote_numa_transport_is_transfer_complete(
 	struct remote_numa_cached_page *cached_target);

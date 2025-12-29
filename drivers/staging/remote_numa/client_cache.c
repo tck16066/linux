@@ -36,6 +36,38 @@ static remote_numa_node_t *choose_donor(remote_numa_client_cache_t *cache)
 
 DEFINE_HASHTABLE(refault_table, REMOTE_NUMA_REFAULT_HASH_BITS);
 
+struct mm_drop_work {
+    struct work_struct work;
+    struct mm_struct *mm;
+};
+
+static void mm_drop_workfn(struct work_struct *work)
+{
+    struct mm_drop_work *w =
+        container_of(work, struct mm_drop_work, work);
+
+    mmdrop(w->mm);
+    kfree(w);
+}
+
+/* atomic context */
+static void defer_mmdrop(struct mm_struct *mm)
+{
+    struct mm_drop_work *w;
+
+    w = kmalloc(sizeof(*w), GFP_ATOMIC);
+    if (!w) {
+        /* last-ditch fallback: leak or WARN */
+        WARN_ON_ONCE(1);
+        return;
+    }
+
+    INIT_WORK(&w->work, mm_drop_workfn);
+    w->mm = mm;
+
+    queue_work(system_unbound_wq, &w->work);
+}
+
 struct refault_entry {
 	struct mm_struct *mm;
 	unsigned long addr;
@@ -131,8 +163,8 @@ evict_victim:
 	 * until the background retry worker completes and cleans it up.
 	 */
 	ret = remote_numa_tx_mem_pg_sync_xfer_async(cache->trprt,
-					victim->donor_pg_cookie,
-					victim->page,
+					victim->known_page->donor_pg_cookie,
+					victim->known_page->page,
 					victim);
 	if (ret != 0) {
 		/* Put it back and clear flag */
@@ -140,7 +172,7 @@ evict_victim:
 		spin_lock(&cache->lock);
 		list_add(&victim->lru_list, &cache->lru_head);
 		/* No need to increment current_cached_pages - we never decremented it */
-		hash_add(cache->page_lookup, &victim->node, (uintptr_t)victim->page);
+		hash_add(cache->page_lookup, &victim->node, (uintptr_t)victim->known_page->page);
 		spin_unlock(&cache->lock);
 		return ret;
 	}
@@ -185,7 +217,7 @@ static void cache_insert(remote_numa_client_cache_t *cache,
 {
 	spin_lock(&cache->lock);
 	list_add(&entry->lru_list, &cache->lru_head);
-	hash_add(cache->page_lookup, &entry->node, (uintptr_t)entry->page);
+	hash_add(cache->page_lookup, &entry->node, (uintptr_t)entry->known_page->page);
 	cache->current_cached_pages++;
 	spin_unlock(&cache->lock);
 }
@@ -220,8 +252,8 @@ static void eviction_completion_worker(struct work_struct *work)
 			    victim->addr < vma->vm_end) {
 				zap_page_range_single(vma, victim->addr, PAGE_SIZE, NULL);
 				refault_table_insert(victim->mm, victim->addr,
-						     victim->donor_pg_cookie,
-						     victim->donor_id);
+						     victim->known_page->donor_pg_cookie,
+						     victim->known_page->donor_id);
 			}
 			mmap_write_unlock(victim->mm);
 		}
@@ -274,8 +306,14 @@ int remote_numa_client_cache_init(remote_numa_client_cache_t *cache,
 			__free_page(page);
 			return -ENOMEM;
 		}
-		entry->page = page;
-		entry->donor_pg_cookie = 0;
+		entry->known_page = kzalloc(sizeof(remote_numa_known_page_t), GFP_KERNEL);
+		if (!entry->known_page) {
+			kfree(entry);
+			__free_page(page);
+			return -ENOMEM;
+		}
+		entry->known_page->page = page;
+		entry->known_page->donor_pg_cookie = 0;
 		atomic_set(&entry->transfer_in_progress, 0);
 
 		list_add(&entry->lru_list, &cache->free_list);
@@ -295,7 +333,8 @@ void remote_numa_client_cache_destroy(remote_numa_client_cache_t *cache)
 		entry = list_entry(pos, remote_numa_cached_page_t, lru_list);
 		list_del(pos);
 		hash_del(&entry->node);
-		__free_page(entry->page);
+		__free_page(entry->known_page->page);
+		kfree(entry->known_page);
 		if (entry->mm) {
 			mmdrop(entry->mm);
 		}
@@ -304,7 +343,8 @@ void remote_numa_client_cache_destroy(remote_numa_client_cache_t *cache)
 	list_for_each_safe(pos, tmp, &cache->free_list) {
 		entry = list_entry(pos, remote_numa_cached_page_t, lru_list);
 		list_del(pos);
-		__free_page(entry->page);
+		__free_page(entry->known_page->page);
+		kfree(entry->known_page);
 		if (entry->mm) {
 			mmdrop(entry->mm);
 		}
@@ -333,7 +373,7 @@ struct page *remote_numa_client_cache_alloc(remote_numa_client_cache_t *cache,
 			} else if (status == 0) {
 				/* Transfer complete */
 				atomic_set(&existing->transfer_in_progress, 0);
-				return existing->page;
+				return existing->known_page->page;
 			}
 			/* Error case - fall through to retry */
 			break;
@@ -368,9 +408,9 @@ struct page *remote_numa_client_cache_alloc(remote_numa_client_cache_t *cache,
 
 	remote_numa_node_t *donor = choose_donor(cache);
 
-	entry->donor_pg_cookie = 0;
-	entry->donor_id = donor->node_id;
-	entry->donor_cookie = donor->donor_cookie;
+	entry->known_page->donor_pg_cookie = 0;
+	entry->known_page->donor_id = donor->node_id;
+	entry->known_page->donor_cookie = donor->donor_cookie;
 	entry->mm = vmf->vma->vm_mm;
 	mmgrab(entry->mm);  /* Hold ref - eviction will zap PTE asynchronously */
 	entry->addr = vmf->address;
@@ -455,9 +495,9 @@ int remote_numa_client_cache_refault(remote_numa_client_cache_t *cache,
 	/* Mark this entry as having a transfer in progress */
 	atomic_set(&entry->transfer_in_progress, 1);
 
-	entry->page = faulting_page;
-	entry->donor_pg_cookie = donor_pg_cookie;
-	entry->donor_id = donor_id;
+	entry->known_page->page = faulting_page;
+	entry->known_page->donor_pg_cookie = donor_pg_cookie;
+	entry->known_page->donor_id = donor_id;
 	entry->mm = vmf->vma->vm_mm;
 	mmgrab(entry->mm);  /* Hold ref - eviction will zap PTE asynchronously */
 	entry->addr = vmf->address;
@@ -501,14 +541,14 @@ int remote_numa_client_cache_free_page(remote_numa_client_cache_t *cache,
 
 	spin_lock(&cache->lock);
 	hash_for_each_possible(cache->page_lookup, entry, node, (uintptr_t)page) {
-		if (entry->page == page) {
+		if (entry->known_page->page == page) {
 			list_del(&entry->lru_list);
 			cache->current_cached_pages--;
 			hash_del(&entry->node);
 			
 			/* Save info we need for remote free */
-			donor_id = entry->donor_id;
-			donor_pg_cookie = entry->donor_pg_cookie;
+			donor_id = entry->known_page->donor_id;
+			donor_pg_cookie = entry->known_page->donor_pg_cookie;
 			main_pg_cookie = (uintptr_t)entry;
 			found = true;
 			break;
@@ -536,7 +576,7 @@ int remote_numa_client_cache_free_page(remote_numa_client_cache_t *cache,
 	
 	/* Drop mm reference before moving to free list */
 	if (entry->mm) {
-		mmdrop(entry->mm);
+		defer_mmdrop(entry->mm); /* mmdrop is not safe to call while atomic. */
 		entry->mm = NULL;
 	}
 

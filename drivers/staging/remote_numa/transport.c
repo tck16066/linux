@@ -240,13 +240,13 @@ static int remote_numa_send_segment(main_xfer_state_t *xfer, u32 offset, u16 seg
 
 	msg->hdr.version = REMOTE_NUMA_SUPPORTED_PROTO;
 	msg->hdr.type = xfer->transfer_type;
-	msg->hdr.main_cookie = xfer->cached_pg->donor_id;
-	msg->hdr.donor_cookie = xfer->cached_pg->donor_cookie;
+	msg->hdr.main_cookie = xfer->cached_pg->known_page->donor_id;
+	msg->hdr.donor_cookie = xfer->cached_pg->known_page->donor_cookie;
 	msg->flags = (offset + payload_len >= PAGE_SIZE) ? remote_numa_xfer_end_of_pg : 0;
 	msg->seq_num = offset;
 	msg->payload_len = payload_len;
 	msg->sender_pg_cookie = xfer->cached_pg->main_pg_cookie;
-	msg->receiver_pg_cookie = xfer->cached_pg->donor_pg_cookie;
+	msg->receiver_pg_cookie = xfer->cached_pg->known_page->donor_pg_cookie;
 	msg->hack = xfer->hack;
 	spin_unlock(&hacky_spinlock);
 
@@ -445,9 +445,9 @@ static remote_numa_receive_ret_t remote_numa_rx_mem_pg_refetch(
 	// they're referred to by donor/main name in the send* function.
 	
 	cached_pg->main_pg_cookie = rn_pg->donor_pg_cookie;
-	cached_pg->donor_pg_cookie = refetch->main_pg_cookie;
-	cached_pg->donor_id = refetch->hdr.main_cookie; //gross. broke an abstraction.
-	cached_pg->donor_cookie = refetch->hdr.donor_cookie;
+	cached_pg->known_page->donor_pg_cookie = refetch->main_pg_cookie;
+	cached_pg->known_page->donor_id = refetch->hdr.main_cookie; //gross. broke an abstraction.
+	cached_pg->known_page->donor_cookie = refetch->hdr.donor_cookie;
 
 	spin_lock(&hacky_spinlock);
 	xfer->hack		= ++hack;
@@ -484,7 +484,7 @@ remote_numa_send_ret_t remote_numa_transport_alloc_page_async(
 {
 	spin_lock(&hacky_spinlock);
 	u64 main_pg_cookie = (uintptr_t)cached_target;
-	struct page *target = cached_target->page;
+	struct page *target = cached_target->known_page->page;
 	main_xfer_state_t *xfer = kzalloc(sizeof(*xfer), GFP_ATOMIC);
 	if (!xfer) {
 		spin_unlock(&hacky_spinlock);
@@ -494,9 +494,9 @@ remote_numa_send_ret_t remote_numa_transport_alloc_page_async(
 
 	xfer->hack = ++hack;
 	xfer->cached_pg = cached_target;
-	xfer->cached_pg->donor_pg_cookie = 12345;
+	xfer->cached_pg->known_page->donor_pg_cookie = 12345;
 	xfer->cached_pg->main_pg_cookie = main_pg_cookie;
-	xfer->cached_pg->donor_id = donor->node_id;
+	xfer->cached_pg->known_page->donor_id = donor->node_id;
 	xfer->target = target;
 	xfer->transfer_type = remote_numa_mem_alloc;
 	xfer->last_update = ktime_get();
@@ -547,63 +547,6 @@ remote_numa_send_ret_t remote_numa_transport_alloc_page_async(
 	return remote_numa_send_success;
 }
 
-remote_numa_send_ret_t remote_numa_transport_alloc_page_rcu(
-	struct remote_numa_main_trprt_if *trprt,
-	remote_numa_node_t *donor,
-	struct remote_numa_cached_page *cached_target)
-{
-	remote_numa_send_ret_t ret = remote_numa_transport_alloc_page_async(trprt, donor, cached_target);
-	if (ret != remote_numa_send_success)
-		return ret;
-
-	main_xfer_state_t *xfer = xfer_lookup((uintptr_t)cached_target);
-	if (!xfer)
-		return remote_numa_send_err_unknown;
-
-	if (remote_numa_xfer_wait_complete(xfer, (msecs_to_jiffies(REMOTE_NUMA_TRANSFER_TIMEOUT_MS)))) {
-		 hash_del(&xfer->node);
-		 xfer_free(xfer);
-		 printk(KERN_DEBUG "Timeout waiting for remote page allocation ack.\n");
-		 return remote_numa_send_timeout;
-	}
-
-	hash_del(&xfer->node);
-	xfer_free(xfer);
-	return remote_numa_send_success;
-}
-
-/* Blocking version */
-remote_numa_send_ret_t remote_numa_transport_refetch_page(
-	struct remote_numa_main_trprt_if *trprt,
-	u32 donor_node_id,
-	u64 donor_pg_cookie,
-	struct remote_numa_cached_page *cached_target)
-{
-	remote_numa_send_ret_t ret = remote_numa_transport_refetch_page_async(
-		trprt, donor_node_id, donor_pg_cookie, cached_target);
-	if (ret != remote_numa_send_success)
-		return ret;
-
-	main_xfer_state_t *xfer = xfer_lookup((uintptr_t)cached_target);
-	if (!xfer)
-		return remote_numa_send_err_unknown;
-
-	if (remote_numa_xfer_wait_complete(xfer, msecs_to_jiffies(REMOTE_NUMA_TRANSFER_TIMEOUT_MS))) {
-		spin_lock(&hacky_spinlock);
-		hash_del(&xfer->node);
-		spin_unlock(&hacky_spinlock);
-		xfer_free(xfer);
-		printk(KERN_WARNING "send timeout waiting for remote page refetch.\n");
-		return remote_numa_send_timeout;
-	}
-	spin_lock(&hacky_spinlock);
-	hash_del(&xfer->node);
-	spin_unlock(&hacky_spinlock);
-	xfer_free(xfer);
-	return remote_numa_send_success;
-}
-
-/* Non-blocking version */
 remote_numa_send_ret_t remote_numa_transport_refetch_page_async(
 	struct remote_numa_main_trprt_if *trprt,
 	u32 donor_node_id,
@@ -630,9 +573,9 @@ remote_numa_send_ret_t remote_numa_transport_refetch_page_async(
 		return remote_numa_send_bad_alloc;
 
 	xfer->cached_pg = cached_target;
-	xfer->cached_pg->donor_pg_cookie = donor_pg_cookie;
-	xfer->cached_pg->donor_id = donor_node_id;
-	xfer->target = cached_target->page;
+	xfer->cached_pg->known_page->donor_pg_cookie = donor_pg_cookie;
+	xfer->cached_pg->known_page->donor_id = donor_node_id;
+	xfer->target = cached_target->known_page->page;
 	xfer->transfer_type = remote_numa_mem_refetch;
 	xfer->last_update = ktime_get();
 	xfer->cached_pg->main_pg_cookie = (uintptr_t)cached_target;
@@ -747,7 +690,7 @@ remote_numa_receive_ret_t remote_numa_rx_mem_pg_sat_ack(
 	spin_lock(&hacky_spinlock);
 	bitmap_fill(xfer->received_bitmap, PAGE_SIZE);
 
-	xfer->cached_pg->donor_pg_cookie = ack->donor_pg_cookie;
+		xfer->cached_pg->known_page->donor_pg_cookie = ack->donor_pg_cookie;
 	smp_wmb();
 	wake_up(&xfer->waitq);
 	spin_unlock(&hacky_spinlock);
@@ -784,7 +727,7 @@ remote_numa_send_ret_t remote_numa_tx_mem_pg_sync_xfer_async(
 	remote_numa_node_t *donor = __remote_numa_get_node_locking(
 		main_if->trprt_ctx->node_table,
 		REMOTE_NUMA_HASH_TABLE_ORDER,
-		victim->donor_id);
+				victim->known_page->donor_id);
 	if (!donor)
 		return remote_numa_send_no_if;
 
@@ -1247,9 +1190,15 @@ remote_numa_send_ret_t remote_numa_tx_mem_pg_free(
 		xfer_free(xfer);
 		return remote_numa_send_bad_alloc;
 	}
+	cached_pg->known_page = kzalloc(sizeof(*cached_pg->known_page), GFP_KERNEL);
+	if (!cached_pg->known_page) {
+		kfree(cached_pg);
+		xfer_free(xfer);
+		return remote_numa_send_bad_alloc;
+	}
 	cached_pg->main_pg_cookie = main_pg_cookie;
-	cached_pg->donor_pg_cookie = donor_pg_cookie;
-	cached_pg->donor_id = donor_id;
+	cached_pg->known_page->donor_pg_cookie = donor_pg_cookie;
+	cached_pg->known_page->donor_id = donor_id;
 
 	xfer->cached_pg = cached_pg;
 	xfer->target = NULL;  // no local page, just waiting for ack
@@ -1401,10 +1350,7 @@ void tmp_init(void)
 }
 EXPORT_SYMBOL_GPL(tmp_init);
 
-
-EXPORT_SYMBOL_GPL(remote_numa_transport_alloc_page_rcu);
 EXPORT_SYMBOL_GPL(remote_numa_transport_alloc_page_async);
-EXPORT_SYMBOL_GPL(remote_numa_transport_refetch_page);
 EXPORT_SYMBOL_GPL(remote_numa_transport_refetch_page_async);
 EXPORT_SYMBOL_GPL(remote_numa_tx_mem_pg_sync_xfer_async);
 EXPORT_SYMBOL_GPL(remote_numa_transport_is_transfer_complete);

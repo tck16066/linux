@@ -77,7 +77,10 @@ static int test_page_lifecycle(remote_numa_client_cache_t *cache, unsigned long 
         int retry_count = 0;
         const int max_retries = 10;
         while (retry_count < max_retries) {
+            /* Simulate atomic context as in kernel page fault handler */
+            preempt_disable();
             pages[i] = remote_numa_client_cache_alloc(cache, &fake_vmf);
+            preempt_enable();
             if (IS_ERR(pages[i])) {
                 if (PTR_ERR(pages[i]) == -EAGAIN) {
                     printk(KERN_INFO "[TEST] Allocation %d: transfer in progress, retrying (attempt %d)...\n",
@@ -123,7 +126,10 @@ static int test_page_lifecycle(remote_numa_client_cache_t *cache, unsigned long 
         int retry_count = 0;
         const int max_retries = 10;
         while (retry_count < max_retries) {
+            /* Simulate atomic context as in kernel page fault handler */
+            preempt_disable();
             ret = remote_numa_client_cache_refault(cache, pages[i], &fake_vmf);
+            preempt_enable();
             if (ret == -EAGAIN) {
                 printk(KERN_INFO "[TEST] Refault %d: transfer in progress, retrying (attempt %d)...\n",
                        i, retry_count + 1);
@@ -175,7 +181,10 @@ static int test_page_lifecycle(remote_numa_client_cache_t *cache, unsigned long 
     // Clean up all allocated pages to avoid filling the cache across test runs
     printk(KERN_INFO "[TEST] Freeing all %d allocated pages...\n", TOTAL_TEST_PAGES);
     for (int i = 0; i < TOTAL_TEST_PAGES; i++) {
+        /* Simulate atomic context as in kernel page fault handler */
+        preempt_disable();
         ret = remote_numa_client_cache_free_page(cache, pages[i]);
+        preempt_enable();
         if (ret && ret != -ENOENT) {
             printk(KERN_WARNING "[TEST] Failed to free page %d: error %d\n", i, ret);
         }

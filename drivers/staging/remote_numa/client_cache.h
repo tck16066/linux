@@ -21,11 +21,15 @@
 
 struct remote_numa_main_trprt_if;
 
-typedef struct remote_numa_cached_page {
+typedef struct remote_numa_known_page {
 	struct page *page;
 	u64 donor_pg_cookie;
 	u32 donor_id;
 	u32 donor_cookie;
+} remote_numa_known_page_t;
+
+typedef struct remote_numa_cached_page {
+	struct remote_numa_known_page *known_page;
 	struct list_head lru_list;
 	struct mm_struct *mm;
 	uintptr_t addr;
