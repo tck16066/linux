@@ -28,7 +28,8 @@ extern remote_numa_client_cache_t *client_cache;
 remote_numa_client_cache_t *global_remote_cache = NULL;
 
 /* Allocate enough pages to trigger cache eviction (cache holds 1200) */
-#define TOTAL_TEST_PAGES 1205
+#define TOTAL_REFAULTS 600
+#define TOTAL_TEST_PAGES (1200 + TOTAL_REFAULTS)
 #define REMOTE_NUMA_RUN_TEST _IOW('R', 1, unsigned long)
 
 static dev_t devno;
@@ -110,16 +111,18 @@ static int test_page_lifecycle(remote_numa_client_cache_t *cache, unsigned long 
         printk(KERN_INFO "[TEST] Allocation %d succeeded\n", i);
 
         void *kaddr = kmap_local_page(pages[i]);
-        memset(kaddr, i, PAGE_SIZE);
+        for (int j = 0; j < PAGE_SIZE; j++) {
+            ((unsigned char *)kaddr)[j] = (unsigned char)(i ^ j);
+        }
         kunmap_local(kaddr);
     }
 
     printk(KERN_INFO "[TEST] All %d pages allocated successfully\n", TOTAL_TEST_PAGES);
-    printk(KERN_INFO "[TEST] Pages 0-4 should have been evicted to make room for later pages\n");
+    printk(KERN_INFO "[TEST] Pages should have been evicted to make room for later pages\n");
 
-    // Refault and verify all 5 evicted pages
+    // Refault and verify all TOTAL_REFAULTS evicted pages
     bool all_valid = true;
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < TOTAL_REFAULTS; i++) {
         printk(KERN_INFO "[TEST] Attempting to refault evicted page %d...\n", i);
         *((unsigned long *)&fake_vmf.address) = addr + (i * PAGE_SIZE);
         
@@ -154,11 +157,11 @@ static int test_page_lifecycle(remote_numa_client_cache_t *cache, unsigned long 
 
         printk(KERN_INFO "[TEST] Refault %d succeeded\n", i);
 
-        // Verify the refaulted page data
+        // Verify the refaulted page data (do NOT overwrite)
         void *kaddr = kmap_local_page(pages[i]);
         bool valid = true;
-        unsigned char expected = (unsigned char)i;
         for (int j = 0; j < PAGE_SIZE; j++) {
+            unsigned char expected = (unsigned char)(i ^ j);
             if (((unsigned char *)kaddr)[j] != expected) {
                 valid = false;
                 printk(KERN_ERR "[TEST] Page %d data corrupted at offset %d: expected %u, got %u\n",

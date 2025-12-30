@@ -23,16 +23,17 @@ struct remote_numa_main_trprt_if;
 
 typedef struct remote_numa_known_page {
 	struct page *page;
+	struct mm_struct *mm; /* now belongs here */
+	unsigned long addr;
 	u64 donor_pg_cookie;
 	u32 donor_id;
 	u32 donor_cookie;
+	struct hlist_node node; /* for hash table linkage */
 } remote_numa_known_page_t;
 
 typedef struct remote_numa_cached_page {
 	struct remote_numa_known_page *known_page;
 	struct list_head lru_list;
-	struct mm_struct *mm;
-	uintptr_t addr;
 	uintptr_t main_pg_cookie;
 	struct hlist_node node;
 	atomic_t transfer_in_progress; /* non-zero if alloc/refault/evict in flight */
@@ -48,6 +49,7 @@ typedef struct remote_numa_client_cache {
 	u32 current_cached_pages;
 	struct remote_numa_main_trprt_if *trprt;
 	DECLARE_HASHTABLE(page_lookup, REMOTE_NUMA_CLIENT_CACHE_HASH_BITS);
+	DECLARE_HASHTABLE(known_pages, REMOTE_NUMA_CLIENT_CACHE_HASH_BITS);
 	struct delayed_work eviction_completion_work;
 } remote_numa_client_cache_t;
 

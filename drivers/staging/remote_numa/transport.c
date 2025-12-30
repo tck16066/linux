@@ -150,7 +150,10 @@ static void xfer_free(main_xfer_state_t *xfer)
 	
 	// Free cached_pg if it was allocated for mem_free tracking
 	if (xfer->transfer_type == remote_numa_mem_free && cached)
+	{
+		kfree(cached->known_page);
 		kfree(cached);
+	}
 	
 	kfree(xfer);
 }
@@ -448,6 +451,9 @@ static remote_numa_receive_ret_t remote_numa_rx_mem_pg_refetch(
 	cached_pg->known_page->donor_pg_cookie = refetch->main_pg_cookie;
 	cached_pg->known_page->donor_id = refetch->hdr.main_cookie; //gross. broke an abstraction.
 	cached_pg->known_page->donor_cookie = refetch->hdr.donor_cookie;
+
+	cached_pg->known_page->mm = NULL;
+	cached_pg->known_page->addr = 0;
 
 	spin_lock(&hacky_spinlock);
 	xfer->hack		= ++hack;
