@@ -90,6 +90,8 @@ typedef struct
 typedef struct remote_numa_donor_trprt_if
 {
 	u32 (*remote_numa_node_id)(remote_numa_mem_query_t *);
+	/* Identify sender node from rx_data (preferred for non-query messages). */
+	u32 (*remote_numa_rx_node_id)(void *rx_data, void *payload);
 	u16 (*get_max_payload_len)(void); // Does not count header.
 	void (*free_rx_buff)(void *);
 	void (*prepare_rx_buff)(void *rx_buff, void **payload);

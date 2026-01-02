@@ -116,6 +116,7 @@ static remote_numa_node_t *choose_donor(remote_numa_client_cache_t *cache)
 
 
 DEFINE_HASHTABLE(refault_table, REMOTE_NUMA_REFAULT_HASH_BITS);
+static DEFINE_SPINLOCK(refault_table_lock);
 
 struct mm_drop_work {
     struct work_struct work;
@@ -173,20 +174,47 @@ static void refault_table_insert(struct mm_struct *mm, unsigned long addr,
 	entry->donor_pg_cookie = donor_pg_cookie;
 	entry->donor_id = donor_id;
 	u32 key = refault_hash_key(mm, addr);
+	spin_lock(&refault_table_lock);
 	hash_add(refault_table, &entry->node, key);
+	spin_unlock(&refault_table_lock);
 }
 
-static struct refault_entry*
-refault_table_lookup(struct mm_struct *mm, unsigned long addr)
+static bool refault_table_peek(struct mm_struct *mm, unsigned long addr)
+{
+	struct refault_entry *entry;
+	u32 key = refault_hash_key(mm, addr);
+	bool found = false;
+
+	spin_lock(&refault_table_lock);
+	hash_for_each_possible(refault_table, entry, node, key) {
+		if (entry->mm == mm && entry->addr == addr) {
+			found = true;
+			break;
+		}
+	}
+	spin_unlock(&refault_table_lock);
+	return found;
+}
+
+static bool refault_table_consume(struct mm_struct *mm, unsigned long addr,
+				 u64 *donor_pg_cookie, u32 *donor_id)
 {
 	struct refault_entry *entry;
 	u32 key = refault_hash_key(mm, addr);
 
+	spin_lock(&refault_table_lock);
 	hash_for_each_possible(refault_table, entry, node, key) {
-		if (entry->mm == mm && entry->addr == addr)
-			return entry;
+		if (entry->mm == mm && entry->addr == addr) {
+			*donor_pg_cookie = entry->donor_pg_cookie;
+			*donor_id = entry->donor_id;
+			hash_del(&entry->node);
+			spin_unlock(&refault_table_lock);
+			kfree(entry);
+			return true;
+		}
 	}
-	return NULL;
+	spin_unlock(&refault_table_lock);
+	return false;
 }
 
 static void refault_table_clear(void)
@@ -194,11 +222,12 @@ static void refault_table_clear(void)
 	int bkt;
 	struct refault_entry *entry;
 	struct hlist_node *tmp;
-
+	spin_lock(&refault_table_lock);
 	hash_for_each_safe(refault_table, bkt, tmp, entry, node) {
 		hash_del(&entry->node);
 		kfree(entry);
 	}
+	spin_unlock(&refault_table_lock);
 }
 
 static int maybe_evict(remote_numa_client_cache_t *cache)
@@ -288,6 +317,11 @@ static remote_numa_cached_page_t *reuse_page(remote_numa_client_cache_t *cache)
 			       entry = list_first_entry(&cache->free_list,
 					remote_numa_cached_page_t, lru_list);
 			       list_del(&entry->lru_list);
+			       /*
+				* Entry is now reserved/in-use (even before it is inserted into
+				* the LRU/hash). Count it so capacity checks remain consistent.
+				*/
+			       cache->current_cached_pages++;
 			       /* Do NOT remove known_page here. It must persist until explicit free. */
 		       }
 		       spin_unlock(&cache->lock);
@@ -300,7 +334,6 @@ static void cache_insert(remote_numa_client_cache_t *cache,
 	spin_lock(&cache->lock);
 	list_add(&entry->lru_list, &cache->lru_head);
 	hash_add(cache->page_lookup, &entry->node, (uintptr_t)entry->known_page->page);
-	cache->current_cached_pages++;
 	spin_unlock(&cache->lock);
 }
 
@@ -309,54 +342,80 @@ static void eviction_completion_worker(struct work_struct *work)
 {
 	remote_numa_client_cache_t *cache = container_of(work, 
 		remote_numa_client_cache_t, eviction_completion_work.work);
-	remote_numa_cached_page_t *victim, *tmp;
+	remote_numa_cached_page_t *victim;
 	bool need_reschedule = false;
+	remote_numa_cached_page_t *pass_start = NULL;
+	bool made_progress = false;
+	int iters = 0;
+	const int max_iters = 1024;
 
-	spin_lock(&cache->lock);
-	list_for_each_entry_safe(victim, tmp, &cache->evicting_list, lru_list) {
+	for (;;) {
+		int status;
+
+		if (iters++ >= max_iters) {
+			need_reschedule = true;
+			break;
+		}
+
+		spin_lock(&cache->lock);
+		if (list_empty(&cache->evicting_list)) {
+			spin_unlock(&cache->lock);
+			break;
+		}
+		victim = list_first_entry(&cache->evicting_list,
+					 remote_numa_cached_page_t, lru_list);
+		list_del_init(&victim->lru_list);
 		spin_unlock(&cache->lock);
-		
+
+		if (!pass_start)
+			pass_start = victim;
+
 		/* Check if transfer is complete */
-		int status = remote_numa_check_transfer_complete(victim);
+		status = remote_numa_check_transfer_complete(victim);
 		if (status == -EAGAIN) {
-			/* Still in progress */
+			/* Still in progress: rotate and try others */
 			need_reschedule = true;
 			spin_lock(&cache->lock);
+			list_add_tail(&victim->lru_list, &cache->evicting_list);
+			spin_unlock(&cache->lock);
+			/*
+			 * If we made a full pass without completing anything, stop
+			 * and let the delayed work run again later. Otherwise we can
+			 * spin forever and trigger the watchdog.
+			 */
+			if (victim == pass_start && !made_progress)
+				break;
+			cond_resched();
 			continue;
 		}
-		
+		made_progress = true;
+		pass_start = NULL;
+
 		/* Transfer complete or error - do final cleanup */
-			   if (status == 0 && victim->known_page && victim->known_page->mm && victim->known_page->addr) {
-					   struct vm_area_struct *vma;
-					   mmap_write_lock(victim->known_page->mm);
-					   vma = find_vma(victim->known_page->mm, victim->known_page->addr);
-					   if (vma && victim->known_page->addr >= vma->vm_start &&
-						   victim->known_page->addr < vma->vm_end) {
-							   zap_page_range_single(vma, victim->known_page->addr, PAGE_SIZE, NULL);
-							   refault_table_insert(victim->known_page->mm, victim->known_page->addr,
-													victim->known_page->donor_pg_cookie,
-													victim->known_page->donor_id);
-					   }
-					   mmap_write_unlock(victim->known_page->mm);
-			   }
-		
-		       /* Clear transfer flag and move to free list */
-		       atomic_set(&victim->transfer_in_progress, 0);
+		if (status == 0 && victim->known_page && victim->known_page->mm && victim->known_page->addr) {
+			struct vm_area_struct *vma;
+			mmap_write_lock(victim->known_page->mm);
+			vma = find_vma(victim->known_page->mm, victim->known_page->addr);
+			if (vma && victim->known_page->addr >= vma->vm_start &&
+			    victim->known_page->addr < vma->vm_end) {
+				zap_page_range_single(vma, victim->known_page->addr, PAGE_SIZE, NULL);
+				refault_table_insert(victim->known_page->mm, victim->known_page->addr,
+						   victim->known_page->donor_pg_cookie,
+						   victim->known_page->donor_id);
+			}
+			mmap_write_unlock(victim->known_page->mm);
+		}
 
-		       /* Drop mm reference before moving to free list */
-			       if (victim->known_page && victim->known_page->mm) {
-				       mmdrop(victim->known_page->mm);
-				       victim->known_page->mm = NULL;
-		       }
+		victim->known_page = NULL;
 
-			       /* Do NOT remove known_page here. It must persist until explicit free. */
-
-		       spin_lock(&cache->lock);
-		       list_del(&victim->lru_list);
-		       list_add(&victim->lru_list, &cache->free_list);
-		       cache->current_cached_pages--;
+		/* Clear transfer flag and move to free list */
+		atomic_set(&victim->transfer_in_progress, 0);
+		spin_lock(&cache->lock);
+		list_add(&victim->lru_list, &cache->free_list);
+		cache->current_cached_pages--;
+		spin_unlock(&cache->lock);
+		cond_resched();
 	}
-	spin_unlock(&cache->lock);
 
 	/* Reschedule if there are still pending evictions - check again in 10ms */
 	if (need_reschedule)
@@ -382,23 +441,10 @@ int remote_numa_client_cache_init(remote_numa_client_cache_t *cache,
 	hash_init(refault_table);
 
 	for (u32 i = 0; i < max_cached_pages; ++i) {
-		struct page *page = alloc_page(GFP_KERNEL);
-		if (!page)
-			return -ENOMEM;
-
 		remote_numa_cached_page_t *entry = kzalloc(sizeof(*entry), GFP_KERNEL);
 		if (!entry) {
-			__free_page(page);
 			return -ENOMEM;
 		}
-		entry->known_page = kzalloc(sizeof(remote_numa_known_page_t), GFP_KERNEL);
-		if (!entry->known_page) {
-			kfree(entry);
-			__free_page(page);
-			return -ENOMEM;
-		}
-		entry->known_page->page = page;
-		entry->known_page->donor_pg_cookie = 0;
 		atomic_set(&entry->transfer_in_progress, 0);
 
 		list_add(&entry->lru_list, &cache->free_list);
@@ -460,7 +506,13 @@ struct page *remote_numa_client_cache_alloc(remote_numa_client_cache_t *cache,
 	       hash_for_each(cache->page_lookup, bkt, existing, node) {
 		       remote_numa_known_page_t *kp = existing->known_page;
 		       if (kp && kp->mm == vmf->vma->vm_mm && kp->addr == vmf->address) {
-			       /* Found existing entry - check if transfer is complete */
+			       /* Fast path: already complete */
+			       if (atomic_read(&existing->transfer_in_progress) == 0) {
+				       spin_unlock(&cache->lock);
+				       return kp->page;
+			       }
+
+			       /* In progress: check transfer completion */
 			       spin_unlock(&cache->lock);
 			       int status = remote_numa_check_transfer_complete(existing);
 			       if (status == -EAGAIN) {
@@ -471,25 +523,54 @@ struct page *remote_numa_client_cache_alloc(remote_numa_client_cache_t *cache,
 				       atomic_set(&existing->transfer_in_progress, 0);
 				       return kp->page;
 			       }
-			       /* Error case - fall through to retry */
-			       break;
+
+			       /* Missing xfer state or other error: don't create a duplicate entry. */
+			       return ERR_PTR(-EAGAIN);
 		       }
 	       }
 	spin_unlock(&cache->lock);
 
 	int evict_ret = maybe_evict(cache);
 
-	       if (evict_ret == -EAGAIN) {
-		       /* Eviction blocked by in-progress transfer, tell caller to retry */
-		       return ERR_PTR(-EAGAIN);
-	       } else if (evict_ret) {
-		       goto err;
-	       }
+	if (evict_ret == -EAGAIN) {
+		/* Eviction in progress; caller should retry. */
+		return ERR_PTR(-EAGAIN);
+	} else if (evict_ret) {
+		goto err;
+	}
 
-	       remote_numa_cached_page_t *entry = reuse_page(cache);
-	       if (!entry) {
-		       printk(KERN_DEBUG "reuse_page() fail.\n");
-		       goto err;
+	remote_numa_cached_page_t *entry = reuse_page(cache);
+	if (!entry) {
+		/*
+		 * Under contention, another thread may have consumed the last free entry
+		 * after our eviction check. Try to kick eviction once more and ask the
+		 * caller to retry rather than failing the allocation.
+		 */
+		evict_ret = maybe_evict(cache);
+		if (evict_ret == -EAGAIN || evict_ret == 0)
+			return ERR_PTR(-EAGAIN);
+		if (evict_ret)
+			goto err;
+
+		       unsigned int free_len = 0, lru_len = 0, lru_busy = 0, evict_len = 0;
+		       remote_numa_cached_page_t *it;
+		       u32 cur_cached, max_cached;
+		       spin_lock(&cache->lock);
+		       cur_cached = cache->current_cached_pages;
+		       max_cached = cache->max_cached_pages;
+		       list_for_each_entry(it, &cache->free_list, lru_list)
+			       free_len++;
+		       list_for_each_entry(it, &cache->lru_head, lru_list) {
+			       lru_len++;
+			       if (atomic_read(&it->transfer_in_progress))
+				       lru_busy++;
+		       }
+		       list_for_each_entry(it, &cache->evicting_list, lru_list)
+			       evict_len++;
+		       spin_unlock(&cache->lock);
+		       printk_ratelimited(KERN_DEBUG "reuse_page() fail: cur_cached=%u max=%u free=%u lru=%u lru_busy=%u evicting=%u\n",
+			       cur_cached, max_cached, free_len, lru_len, lru_busy, evict_len);
+		       return ERR_PTR(-EAGAIN);
 	       }
 
 	       /* Always allocate a new known_page for this (mm, addr) */
@@ -497,6 +578,7 @@ struct page *remote_numa_client_cache_alloc(remote_numa_client_cache_t *cache,
 		       if (!page) {
 			       spin_lock(&cache->lock);
 			       list_add(&entry->lru_list, &cache->free_list);
+			       cache->current_cached_pages--;
 			       spin_unlock(&cache->lock);
 			       return ERR_PTR(-ENOMEM);
 		       }
@@ -505,6 +587,7 @@ struct page *remote_numa_client_cache_alloc(remote_numa_client_cache_t *cache,
 			       __free_page(page);
 			       spin_lock(&cache->lock);
 			       list_add(&entry->lru_list, &cache->free_list);
+			       cache->current_cached_pages--;
 			       spin_unlock(&cache->lock);
 			       goto err;
 		       }
@@ -542,6 +625,7 @@ struct page *remote_numa_client_cache_alloc(remote_numa_client_cache_t *cache,
 			       atomic_set(&entry->transfer_in_progress, 0);
 			       spin_lock(&cache->lock);
 			       list_add(&entry->lru_list, &cache->free_list);
+			       cache->current_cached_pages--;
 			       spin_unlock(&cache->lock);
 			       known_pages_remove(cache, kp->page);
 			       kfree(kp);
@@ -552,7 +636,7 @@ struct page *remote_numa_client_cache_alloc(remote_numa_client_cache_t *cache,
 	       return ERR_PTR(-EAGAIN);
 err:
 	printk(KERN_DEBUG "Failure to allocate remote page.\n");
-	return NULL;
+	return ERR_PTR(-ENOMEM);
 }
 
 int here = 0;
@@ -594,21 +678,34 @@ int remote_numa_client_cache_refault(remote_numa_client_cache_t *cache,
 		return -ENOMEM;
 	}
 
-	struct refault_entry *rentry = refault_table_lookup(mm, addr);
-	if (!rentry)
+	u64 donor_pg_cookie;
+	u32 donor_id;
+	if (!refault_table_consume(mm, addr, &donor_pg_cookie, &donor_id))
 		return -ENOENT;
 
-	u64 donor_pg_cookie = rentry->donor_pg_cookie;
-	u32 donor_id = rentry->donor_id;
-
-	       remote_numa_cached_page_t *entry = reuse_page(cache);
-	       if (!entry)
-		       return -ENOMEM;
+	remote_numa_cached_page_t *entry = reuse_page(cache);
+	if (!entry) {
+		/* Cache full under contention; try to evict and retry. */
+		evict_ret = maybe_evict(cache);
+		if (evict_ret == -EAGAIN || evict_ret == 0)
+			return -EAGAIN;
+		return -ENOMEM;
+	}
 
 	       /* Look up known_page for this (mm, addr) */
 		       remote_numa_known_page_t *kp = known_pages_lookup(cache, faulting_page);
-		       if (!kp)
-			       return -ENOENT; /* Should never happen: refault only if known */
+		       if (!kp) {
+			       /*
+				* Should never happen, but under concurrency we must not leak
+				* entries from free_list.
+				*/
+			       atomic_set(&entry->transfer_in_progress, 0);
+			       spin_lock(&cache->lock);
+			       list_add(&entry->lru_list, &cache->free_list);
+			       cache->current_cached_pages--;
+			       spin_unlock(&cache->lock);
+			       return -ENOENT;
+		       }
 		       entry->known_page = kp;
 
 	       /* Mark this entry as having a transfer in progress */
@@ -626,6 +723,7 @@ int remote_numa_client_cache_refault(remote_numa_client_cache_t *cache,
 		       atomic_set(&entry->transfer_in_progress, 0);
 		       spin_lock(&cache->lock);
 		       list_add(&entry->lru_list, &cache->free_list);
+		       cache->current_cached_pages--;
 		       spin_unlock(&cache->lock);
 		       return -EIO;
 	       }
@@ -685,9 +783,16 @@ int remote_numa_client_cache_free_page(remote_numa_client_cache_t *cache,
 	       return 0;
 }
 
+bool remote_numa_client_cache_refault_pending(struct mm_struct *mm,
+					     unsigned long addr)
+{
+	return refault_table_peek(mm, addr);
+}
+
 EXPORT_SYMBOL_GPL(remote_numa_client_cache_init);
 EXPORT_SYMBOL_GPL(remote_numa_client_cache_alloc);
 EXPORT_SYMBOL_GPL(remote_numa_client_cache_refault);
 EXPORT_SYMBOL_GPL(remote_numa_client_cache_destroy);
 EXPORT_SYMBOL_GPL(remote_numa_client_cache_free_page);
+EXPORT_SYMBOL_GPL(remote_numa_client_cache_refault_pending);
 

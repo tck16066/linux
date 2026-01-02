@@ -43,10 +43,25 @@ static mem_pool_t *make_pool(void)
 	if (!pool->pages)
 		goto fail;
 
+	for (int i = 0; i < REMOTE_NUMA_POOL_SIZE; i++) {
+		pool->pages[i].cached_pg.known_page =
+			kzalloc(sizeof(*pool->pages[i].cached_pg.known_page), GFP_KERNEL);
+		if (!pool->pages[i].cached_pg.known_page)
+			goto fail;
+	}
+
 	return pool;
 
 fail:
 	if (pool) {
+		if (pool->pages) {
+			for (int i = 0; i < REMOTE_NUMA_POOL_SIZE; i++) {
+				kfree(pool->pages[i].cached_pg.known_page);
+				pool->pages[i].cached_pg.known_page = NULL;
+			}
+			kfree(pool->pages);
+			pool->pages = NULL;
+		}
 		vfree(pool->data);
 		kfree(pool);
 	}
@@ -56,6 +71,10 @@ fail:
 static void clean_pool(mem_pool_t *pool)
 {
 	if (!pool) return;
+	if (pool->pages) {
+		for (int i = 0; i < REMOTE_NUMA_POOL_SIZE; i++)
+			kfree(pool->pages[i].cached_pg.known_page);
+	}
 	vfree(pool->data);
 	kfree(pool->pages);
 	kfree(pool);

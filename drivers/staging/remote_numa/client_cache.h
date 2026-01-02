@@ -74,6 +74,9 @@ int remote_numa_client_cache_refault(remote_numa_client_cache_t *cache,
 int remote_numa_client_cache_free_page(remote_numa_client_cache_t *cache,
 				       struct page *page);
 
+bool remote_numa_client_cache_refault_pending(struct mm_struct *mm,
+					     unsigned long addr);
+
 /*
  * Check if an async allocation or refault has completed.
  * Returns 0 if ready, -EAGAIN if still in progress, -ENOENT if not found.

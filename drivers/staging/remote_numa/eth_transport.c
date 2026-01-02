@@ -9,11 +9,11 @@
 #include <linux/hashtable.h>
 #include <linux/if.h> 
 #include <linux/if_ether.h>
+#include <linux/jhash.h>
 #include <linux/kernel.h>
 #include <linux/netdevice.h>
 #include <linux/net_custom_hook.h>
 #include <linux/rcupdate.h>
-#include <linux/siphash.h>
 #include <linux/skbuff.h>
 #include <linux/slab.h>
 #include <linux/string.h>
@@ -45,7 +45,18 @@
 	} while (0)
 
 
-static siphash_key_t net_secret;
+static u32 mac_to_node_id(const u8 *mac)
+{
+	u32 id;
+
+	if (!mac)
+		return 0;
+	/* Deterministic mapping across nodes; collisions are possible but rare. */
+	id = jhash(mac, ETH_ALEN, 0);
+	if (id == 0)
+		id = 1;
+	return id;
+}
 
 static const u8 REMOTE_NUMA_SERVICE_MAC[ETH_ALEN] = {
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
@@ -179,8 +190,6 @@ void remote_numa_clean_donor_trprt_if(remote_numa_donor_trprt_if_t *iface)
 
 void remote_numa_clean_main_trprt_if(remote_numa_main_trprt_if_t *iface)
 {
-	get_random_bytes(&net_secret, sizeof(net_secret));
-
 	// TODO make a cleaner function in the if for the ctx, then move this
 	// calling function to transport.c
 	rcu_assign_pointer(custom_net_hook, NULL);
@@ -197,14 +206,25 @@ void remote_numa_clean_main_trprt_if(remote_numa_main_trprt_if_t *iface)
 
 static u32 advert_to_node_id(remote_numa_advert_t *ad)
 {
-	return hsiphash(ad->return_info.abstract_info,
-		ETH_ALEN, (const hsiphash_key_t *) &net_secret);
+	return mac_to_node_id(ad->return_info.abstract_info);
 }
 
 static u32 mem_query_to_node_id(remote_numa_mem_query_t *mem)
 {
-	return hsiphash(mem->return_info.abstract_info,
-		ETH_ALEN, (const hsiphash_key_t *) &net_secret);
+	return mac_to_node_id(mem->return_info.abstract_info);
+}
+
+static u32 rx_skb_to_node_id(void *rx_data, void *payload)
+{
+	struct sk_buff *skb = rx_data;
+	struct ethhdr *eth;
+
+	if (!skb)
+		return 0;
+	eth = eth_hdr(skb);
+	if (!eth)
+		return 0;
+	return mac_to_node_id(eth->h_source);
 }
 
 static remote_numa_send_ret_t send_msg(struct remote_numa_eth_trprt_ctx *ctx,
@@ -348,8 +368,6 @@ static remote_numa_receive_ret_t remote_numa_eth_rx_mem_resp
 
 remote_numa_donor_trprt_if_t *remote_numa_eth_donor_init(struct remote_numa_mem_mgr *mem)
 {
-	get_random_bytes(&net_secret, sizeof(net_secret));
-
 	remote_numa_donor_trprt_if_t *ptr = kzalloc(sizeof(*ptr), GFP_KERNEL);
 	if (!ptr)
 	{
@@ -359,6 +377,7 @@ remote_numa_donor_trprt_if_t *remote_numa_eth_donor_init(struct remote_numa_mem_
 
 	ptr->priv_return_info_from_mem_query = eth_priv_return_info_from_mem_query;
 	ptr->remote_numa_node_id = mem_query_to_node_id;
+	ptr->remote_numa_rx_node_id = rx_skb_to_node_id;
 	ptr->get_max_payload_len = max_payload_len;
 	ptr->alloc_tx_buffer = alloc_tx_buffer;
 	ptr->prepare_rx_buff = prepare_rx_buff;
