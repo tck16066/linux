@@ -251,6 +251,8 @@ static int maybe_evict(remote_numa_client_cache_t *cache)
 		if (atomic_read(&victim->transfer_in_progress) == 0) {
 			/* Try to claim it for eviction */
 			if (atomic_cmpxchg(&victim->transfer_in_progress, 0, 1) == 0) {
+				if (victim->known_page)
+					atomic_set(&victim->known_page->evict_in_progress, 1);
 				/* Successfully claimed - remove from LRU */
 				list_del(&victim->lru_list);
 				hash_del(&victim->node);
@@ -279,6 +281,8 @@ evict_victim:
 	if (ret != 0) {
 		/* Put it back and clear flag */
 		atomic_set(&victim->transfer_in_progress, 0);
+		if (victim->known_page)
+			atomic_set(&victim->known_page->evict_in_progress, 0);
 		spin_lock(&cache->lock);
 		list_add(&victim->lru_list, &cache->lru_head);
 		/* No need to increment current_cached_pages - we never decremented it */
@@ -405,6 +409,8 @@ static void eviction_completion_worker(struct work_struct *work)
 			}
 			mmap_write_unlock(victim->known_page->mm);
 		}
+		if (victim->known_page)
+			atomic_set(&victim->known_page->evict_in_progress, 0);
 
 		victim->known_page = NULL;
 
@@ -594,6 +600,7 @@ struct page *remote_numa_client_cache_alloc(remote_numa_client_cache_t *cache,
 		       kp->donor_pg_cookie = 0;
 		       kp->donor_id = 0;
 		       kp->donor_cookie = 0;
+		       kp->main_pg_cookie = 0;
 		       known_pages_insert(cache, kp, page, vmf->vma->vm_mm, vmf->address);
 		       entry->known_page = kp;
 
@@ -741,46 +748,103 @@ int remote_numa_client_cache_free_page(remote_numa_client_cache_t *cache,
 {
 	u32 donor_id;
 	u64 donor_pg_cookie;
-	uintptr_t main_pg_cookie;
+	uintptr_t main_pg_cookie = 0;
+	bool found_cache_entry = false;
+	struct page *page_to_free = NULL;
+	remote_numa_known_page_t *kp_to_free = NULL;
 
-	       /* Remove from known_pages and free known_page and its page. Drive found/not found by this. */
-		       remote_numa_known_page_t *kp = known_pages_lookup(cache, page);
-		       if (!kp) {
-			       printk(KERN_WARNING "No entry found for free.");
-			       return -ENOENT;
-		       }
-		       donor_id = kp->donor_id;
-		       donor_pg_cookie = kp->donor_pg_cookie;
-		       spin_lock(&cache->lock);
-		       hash_del(&kp->node);
-		       /* Remove from cache table if present */
-		       remote_numa_cached_page_t *entry = NULL;
-		       hash_for_each_possible(cache->page_lookup, entry, node, (uintptr_t)page) {
-			       if (entry->known_page && entry->known_page->page == page) {
-				       list_del(&entry->lru_list);
-				       cache->current_cached_pages--;
-				       hash_del(&entry->node);
-				       /* Drop mm reference before moving to free list */
-				       if (kp->mm) {
-					       defer_mmdrop(kp->mm);
-					       kp->mm = NULL;
-				       }
-				       /* Add to free list immediately; remote free will complete in background. */
-				       list_add(&entry->lru_list, &cache->free_list);
-			       }
-		       }
-		       __free_page(kp->page);
-		       main_pg_cookie = (uintptr_t)kp;
-		       kfree(kp);
-		       spin_unlock(&cache->lock);
+	/* Remove from known_pages and free known_page and its page. Drive found/not found by this. */
+	remote_numa_known_page_t *kp = known_pages_lookup(cache, page);
+	if (!kp) {
+		printk(KERN_WARNING "remote_numa: No entry found for free.\n");
+		return -ENOENT;
+	}
+	donor_id = kp->donor_id;
+	donor_pg_cookie = kp->donor_pg_cookie;
 
-	       /* Async remote free: schedule work to do the remote free in process context. */
-	       remote_numa_tx_mem_pg_free_async(cache->trprt,
-		       donor_id,
-		       donor_pg_cookie,
-		       main_pg_cookie);
+	spin_lock(&cache->lock);
+	if (atomic_read(&kp->evict_in_progress)) {
+		spin_unlock(&cache->lock);
+		/* Eviction in progress: caller must retry later; do not free. */
+		return -EAGAIN;
+	}
 
-	       return 0;
+	/*
+	 * We must have the cache entry to obtain the correct cookie.
+	 * If it doesn't exist, fail-safe: do NOT free local structures either,
+	 * because an in-flight transfer may still reference them.
+	 */
+	remote_numa_cached_page_t *entry = NULL;
+	hash_for_each_possible(cache->page_lookup, entry, node, (uintptr_t)page) {
+		if (entry->known_page && entry->known_page->page == page) {
+			if (atomic_read(&entry->transfer_in_progress)) {
+				spin_unlock(&cache->lock);
+				/* In flight: caller must retry later; do not free anything. */
+				return -EAGAIN;
+			}
+			main_pg_cookie = entry->main_pg_cookie;
+			found_cache_entry = true;
+			list_del(&entry->lru_list);
+			cache->current_cached_pages--;
+			hash_del(&entry->node);
+			/* Now it is safe to drop known_pages membership. */
+			hash_del(&kp->node);
+			/* Detach before freeing kp to avoid dangling pointer on reuse. */
+			entry->known_page = NULL;
+			/* Drop mm reference before moving to free list */
+			if (kp->mm) {
+				defer_mmdrop(kp->mm);
+				kp->mm = NULL;
+			}
+			/* Add to free list immediately; remote free will complete in background. */
+			list_add(&entry->lru_list, &cache->free_list);
+			break;
+		}
+	}
+
+	if (!found_cache_entry) {
+		/*
+		 * OS is freeing the page: honor it locally even if our cache bookkeeping
+		 * doesn't have a cache entry. Use the main_pg_cookie tracked on known_page
+		 * so we can still issue a normal tracked remote free.
+		 * 
+		 * XXX: this is best-effort, donor can leak since we do not track.
+		 */
+		if (atomic_read(&kp->evict_in_progress)) {
+			spin_unlock(&cache->lock);
+			/* Eviction in progress: caller must retry later; do not free. */
+			return -EAGAIN;
+		}
+		main_pg_cookie = kp->main_pg_cookie;
+		hash_del(&kp->node);
+		if (kp->mm) {
+			defer_mmdrop(kp->mm);
+			kp->mm = NULL;
+		}
+		page_to_free = kp->page;
+		kp_to_free = kp;
+		spin_unlock(&cache->lock);
+
+		__free_page(page_to_free);
+		kfree(kp_to_free);
+
+		remote_numa_tx_mem_pg_free_async(cache->trprt, donor_id,
+					     donor_pg_cookie, main_pg_cookie);
+		return 0;
+	}
+
+	page_to_free = kp->page;
+	kp_to_free = kp;
+	spin_unlock(&cache->lock);
+
+	__free_page(page_to_free);
+	kfree(kp_to_free);
+
+	/* Async remote free: schedule work to do the remote free in process context. */
+	remote_numa_tx_mem_pg_free_async(cache->trprt, donor_id, donor_pg_cookie,
+				       main_pg_cookie);
+
+	return 0;
 }
 
 bool remote_numa_client_cache_refault_pending(struct mm_struct *mm,

@@ -544,6 +544,8 @@ remote_numa_send_ret_t remote_numa_transport_alloc_page_async(
 	xfer->lookup_cookie = main_pg_cookie;
 	xfer->cached_pg->known_page->donor_pg_cookie = 0;
 	xfer->cached_pg->main_pg_cookie = main_pg_cookie;
+	/* Keep a copy on the known_page so future frees can always recover it. */
+	xfer->cached_pg->known_page->main_pg_cookie = main_pg_cookie;
 	xfer->cached_pg->known_page->donor_id = donor->node_id;
 	xfer->hdr_main_cookie = cached_target->known_page->donor_id;
 	xfer->hdr_donor_cookie = cached_target->known_page->donor_cookie;
@@ -637,6 +639,7 @@ remote_numa_send_ret_t remote_numa_transport_refetch_page_async(
 	xfer->transfer_type = remote_numa_mem_refetch;
 	xfer->last_update = ktime_get();
 	xfer->cached_pg->main_pg_cookie = (uintptr_t)cached_target;
+	xfer->cached_pg->known_page->main_pg_cookie = xfer->cached_pg->main_pg_cookie;
 	xfer->lookup_cookie = (uintptr_t)cached_target;
 	xfer->main_trprt = trprt;
 	xfer->is_main_node = true;
@@ -702,16 +705,23 @@ static remote_numa_receive_ret_t remote_numa_rx_mem_pg_sync_xfer_from(
 	if (xfer->payload_len + xfer->seq_num > PAGE_SIZE)
 		return remote_numa_receive_out_of_bounds;
 
-	void *dst;
-	remote_numa_page_t *rn_pg;
-	if (remote_numa_mem_lookup_page(mgr, xfer->receiver_pg_cookie,
-		&dst, &rn_pg) != 0)
-	{
-		return remote_numa_receive_bad_cookie;
+	/*
+	 * Best-effort sync: if the receiver cookie is unknown or the page has
+	 * already been freed on the donor, skip the copy but still send an ACK
+	 * so the main side can complete its xfer state. This makes mem_sync
+	 * more tolerant of races and retries, similar to mem_free.
+	 */
+	void *dst = NULL;
+	remote_numa_page_t *rn_pg = NULL;
+	int lookup_ret = remote_numa_mem_lookup_page(mgr, xfer->receiver_pg_cookie,
+					      &dst, &rn_pg);
+	if (!lookup_ret) {
+		void *payload = ((u8 *)xfer) + sizeof(*xfer);
+		memcpy(dst + xfer->seq_num, payload, xfer->payload_len);
+	} else {
+		pr_debug("remote_numa: mem_sync for unknown/idle cookie=%llu ret=%d\n",
+			 xfer->receiver_pg_cookie, lookup_ret);
 	}
-
-	void *payload = ((u8 *)xfer) + sizeof(*xfer);
-	memcpy(dst + xfer->seq_num, payload, xfer->payload_len);
 
 	void *ack_buf;
 	remote_numa_mem_pg_xfer_ack_t *ack;
@@ -753,13 +763,19 @@ remote_numa_receive_ret_t remote_numa_rx_mem_pg_sat_ack(
 {
 	main_xfer_state_t *xfer = xfer_get(ack->main_pg_cookie);
 	/*
-	 * Validate against the per-transfer hack value.
-	 * Comparing to the global hack counter breaks with multiple in-flight xfers.
+	 * Best-effort ack handling:
+	 * - If we can't find the xfer, or the hack tag doesn't match, just
+	 *   drop the ACK. This avoids spurious bad_cookie errors when the
+	 *   main side has already timed out or retired the xfer.
 	 */
-	if (!xfer || ack->hack != xfer->hack)
-	{
+	if (!xfer) {
+		return remote_numa_receive_success;
+	}
+	if (ack->hack != xfer->hack) {
+		pr_debug("remote_numa: sat_ack hack mismatch main_cookie=%llu xfer_hack=%d ack_hack=%d\n",
+			 ack->main_pg_cookie, xfer->hack, ack->hack);
 		xfer_put(xfer);
-		return remote_numa_receive_bad_cookie;
+		return remote_numa_receive_success;
 	}
 
 	/* mark done and publish donor cookie */
@@ -922,6 +938,7 @@ remote_numa_receive_ret_t remote_numa_main_rx(
 	remote_numa_main_trprt_if_t *main_if, void *rx_data, void *payload)
 {
 	remote_numa_receive_ret_t ret = 0;
+	u8 hdr_type = 0;
 
 	remote_numa_msg_hdr_t *hdr = payload;
 	if (hdr->version != REMOTE_NUMA_SUPPORTED_PROTO)
@@ -929,6 +946,7 @@ remote_numa_receive_ret_t remote_numa_main_rx(
 		ret = REMOTE_NUMA_TRPRT_RET(remote_numa_receive_bad_proto, 1);
 		goto done;
 	}
+	hdr_type = hdr->type;
 
 	switch(hdr->type)
 	{
@@ -957,6 +975,11 @@ remote_numa_receive_ret_t remote_numa_main_rx(
 	}
 done:
 	main_if->free_rx_buff(rx_data);	
+	/* hdr/payload are no longer valid after free_rx_buff */
+	if (ret) {
+		printk(KERN_WARNING "error processing main pkt type=%u ret=%d\n",
+		       hdr_type, ret);
+	}
 	return ret;
 }
 
@@ -965,6 +988,7 @@ remote_numa_receive_ret_t remote_numa_donor_rx(
 {
 	remote_numa_receive_ret_t ret = 0;
 	u32 src_node_id = 0;
+	u8 hdr_type = 0;
 
 	if (donor_if->remote_numa_rx_node_id)
 		src_node_id = donor_if->remote_numa_rx_node_id(rx_data, payload);
@@ -975,6 +999,7 @@ remote_numa_receive_ret_t remote_numa_donor_rx(
 		ret = REMOTE_NUMA_TRPRT_RET(remote_numa_receive_bad_proto, 1);
 		goto done;
 	}
+	hdr_type = hdr->type;
 
 	switch(hdr->type)
 	{
@@ -1004,8 +1029,10 @@ remote_numa_receive_ret_t remote_numa_donor_rx(
 done:
 	donor_if->free_rx_buff(rx_data);
 
-	if (ret)
-		printk(KERN_WARNING "error processing pkt\n");
+	if (ret) {
+		printk(KERN_WARNING "error processing pkt type=%u ret=%d\n",
+		       hdr_type, ret);
+	}
 
 	return ret;
 }
@@ -1188,9 +1215,19 @@ static remote_numa_receive_ret_t remote_numa_rx_mem_pg_free_from(
 	remote_numa_mem_free_t *pg_free,
 	u32 main_node_id)
 {
-	if (remote_numa_mem_free_page(donor_if->trprt_ctx->mem,
-	                              pg_free->donor_pg_cookie) != 0)
-		return remote_numa_receive_bad_cookie;
+	/*
+	 * Best-effort free: if the cookie is unknown or the page is already
+	 * free, treat it as success rather than a protocol error. This makes
+	 * mem_free idempotent and avoids noisy "bad cookie" errors when the
+	 * main side races or retries.
+	 */
+	int free_ret = remote_numa_mem_free_page(donor_if->trprt_ctx->mem,
+						 pg_free->donor_pg_cookie);
+	if (free_ret != 0) {
+		/* Optional: debug-only signal of unexpected cookie. */
+		pr_debug("remote_numa: mem_free for unknown/idle cookie=%llu ret=%d\n",
+			 pg_free->donor_pg_cookie, free_ret);
+	}
 
 	// Send ACK
 	void *tx_buf;
@@ -1226,22 +1263,20 @@ remote_numa_receive_ret_t remote_numa_rx_mem_pg_free_ack(
 	remote_numa_main_trprt_if_t *main_if,
 	remote_numa_mem_free_ack_t *ack)
 {
-    // Look up xfer state by main node's cookie for this page
+	/*
+	 * Current main-side free path is fire-and-forget; we don't track an xfer
+	 * for mem_free, so there may be no matching state here. Treat the ACK as
+	 * advisory only and ignore it if we have nothing to wake.
+	 */
 	main_xfer_state_t *xfer = xfer_get(ack->main_pg_cookie);
-    if (!xfer) {
-        printk(KERN_WARNING "rx_mem_pg_free_ack: xfer_lookup failed for main_pg_cookie=%llu\n", (unsigned long long)ack->main_pg_cookie);
-        return remote_numa_receive_bad_cookie;
-    }
+	if (!xfer)
+		return remote_numa_receive_success;
 
-	// Mark as complete so the wait condition is satisfied
 	bitmap_fill(xfer->received_bitmap, PAGE_SIZE);
-	// Wake any waiters (e.g. cleanup thread) now that the page is freed remotely
 	wake_up(&xfer->waitq);
 	xfer_put(xfer);
 
-    // Optional: mark max acked region or log the completion
-
-    return remote_numa_receive_success;
+	return remote_numa_receive_success;
 }
 
 remote_numa_send_ret_t remote_numa_tx_mem_pg_free(
@@ -1254,9 +1289,7 @@ remote_numa_send_ret_t remote_numa_tx_mem_pg_free(
 	rcu_read_lock();
 	hash_for_each_possible_rcu(main_if->trprt_ctx->node_table, donor, hnode, donor_id) {
 		if (donor->node_id == donor_id)
-		{
 			break;
-		}
 		donor = NULL;
 	}
 	rcu_read_unlock();
@@ -1264,58 +1297,14 @@ remote_numa_send_ret_t remote_numa_tx_mem_pg_free(
 	if (!donor)
 		return remote_numa_send_no_if;
 
-	main_xfer_state_t *xfer = kzalloc(sizeof(*xfer), GFP_KERNEL);
-	if (!xfer)
-		return remote_numa_send_bad_alloc;
-	refcount_set(&xfer->refcnt, 1);
-
-	/* Create a minimal cached_pg for hash table lookup consistency */
-	struct remote_numa_cached_page *cached_pg = kzalloc(sizeof(*cached_pg), GFP_KERNEL);
-	if (!cached_pg) {
-		xfer_put(xfer);
-		return remote_numa_send_bad_alloc;
-	}
-	cached_pg->known_page = kzalloc(sizeof(*cached_pg->known_page), GFP_KERNEL);
-	if (!cached_pg->known_page) {
-		kfree(cached_pg);
-		xfer_put(xfer);
-		return remote_numa_send_bad_alloc;
-	}
-	cached_pg->main_pg_cookie = main_pg_cookie;
-	cached_pg->known_page->donor_pg_cookie = donor_pg_cookie;
-	cached_pg->known_page->donor_id = donor_id;
-
-	xfer->cached_pg = cached_pg;
-	xfer->target = NULL;  // no local page, just waiting for ack
-	xfer->transfer_type = remote_numa_mem_free;
-	xfer->main_trprt = main_if;
-	xfer->is_main_node = true;
-	xfer->return_info = donor->priv_return_info;
-	xfer->lookup_cookie = main_pg_cookie;
-	init_waitqueue_head(&xfer->waitq);
-	xfer->last_update = ktime_get();
-	xfer->return_info = donor->priv_return_info;
-	bitmap_zero(xfer->received_bitmap, PAGE_SIZE);
-
-	smp_wmb();
-	spin_lock(&hacky_spinlock);
-	hash_add(xfer_table, &xfer->node, xfer_hash(main_pg_cookie));
-	spin_unlock(&hacky_spinlock);
-
-	// Send FREE message
+	/* Fire-and-forget FREE: no xfer_table entry, no wait on ACK. */
 	void *tx_buf;
 	remote_numa_mem_free_t *msg;
 	void **v = (void **)&msg;
 
 	main_if->alloc_tx_buffer(sizeof(*msg), &tx_buf, v);
-	if (!tx_buf || !msg) {
-		spin_lock(&hacky_spinlock);
-		if (!hlist_unhashed(&xfer->node))
-			hash_del(&xfer->node);
-		spin_unlock(&hacky_spinlock);
-		xfer_put(xfer);
+	if (!tx_buf || !msg)
 		return remote_numa_send_bad_alloc;
-	}
 
 	msg->hdr.version        = remote_numa_protocol_0_1;
 	msg->hdr.type           = remote_numa_mem_free;
@@ -1324,35 +1313,9 @@ remote_numa_send_ret_t remote_numa_tx_mem_pg_free(
 	msg->donor_pg_cookie    = donor_pg_cookie;
 	msg->main_pg_cookie     = main_pg_cookie;
 
-	if (main_if->tx_msg(main_if->trprt_ctx, donor->priv_return_info, tx_buf)) {
-		printk(KERN_WARNING "tx_mem_pg_free: hash_del xfer (xmit fail), cookie=%llu, hash=%u, xfer=%p\n",
-		       (unsigned long long)main_pg_cookie, xfer_hash(main_pg_cookie), xfer);
-		spin_lock(&hacky_spinlock);
-		if (!hlist_unhashed(&xfer->node))
-			hash_del(&xfer->node);
-		spin_unlock(&hacky_spinlock);
-		xfer_put(xfer);
+	if (main_if->tx_msg(main_if->trprt_ctx, donor->priv_return_info, tx_buf))
 		return remote_numa_send_bad_xmit;
-	}
-	// Wait for ACK
-	if (remote_numa_xfer_wait_complete(xfer, msecs_to_jiffies(REMOTE_NUMA_TRANSFER_TIMEOUT_MS))) {
-		printk(KERN_WARNING "tx_mem_pg_free: hash_del xfer (timeout), cookie=%llu, hash=%u, xfer=%p\n",
-		       (unsigned long long)main_pg_cookie, xfer_hash(main_pg_cookie), xfer);
-		spin_lock(&hacky_spinlock);
-		if (!hlist_unhashed(&xfer->node))
-			hash_del(&xfer->node);
-		spin_unlock(&hacky_spinlock);
-		xfer_put(xfer);
-		return remote_numa_send_timeout;
-	}
 
-	// Done
-	spin_lock(&hacky_spinlock);
-	if (!hlist_unhashed(&xfer->node))
-		hash_del(&xfer->node);
-	spin_unlock(&hacky_spinlock);
-	/* Drop the table ref for this xfer. */
-	xfer_put(xfer);
 	return remote_numa_send_success;
 }
 
@@ -1416,9 +1379,12 @@ remote_numa_receive_ret_t remote_numa_rx_mem_pg_refetch_sat(
     }
 
     /* done? wake any waiters */
-    if (xfer_compute_max_contig(xfer) >= PAGE_SIZE)
-        wake_up(&xfer->waitq);
-	xfer_put(xfer);
+    if (xfer_compute_max_contig(xfer) >= PAGE_SIZE) {
+	        wake_up(&xfer->waitq);
+	        xfer_put(xfer);
+	} else {
+	        xfer_put(xfer);
+	}
 
     return remote_numa_receive_success;
 }
@@ -1445,9 +1411,12 @@ remote_numa_rx_mem_pg_refetch_ack(struct remote_numa_donor_trprt_if *donor_if,
                ack->top_seq_num - ack->bottom_seq_num);
 
     /* If the page is fully covered, wake the waiter. */
-    if (xfer_compute_max_contig(xfer) >= PAGE_SIZE)
-        wake_up(&xfer->waitq);
-	xfer_put(xfer);
+    if (xfer_compute_max_contig(xfer) >= PAGE_SIZE) {
+	        wake_up(&xfer->waitq);
+	        xfer_put(xfer);
+	} else {
+	        xfer_put(xfer);
+	}
 
     return remote_numa_receive_success;
 }

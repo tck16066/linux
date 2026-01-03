@@ -310,6 +310,10 @@ static int stress_free_idx(struct stress_thread_info *info, int idx, unsigned lo
     preempt_enable();
     up(&info->ctx->sem);
 
+	/* Busy/in-flight: do not treat as failure; retry later and keep ownership. */
+	if (ret == -EAGAIN)
+		return -EAGAIN;
+
     if (ret == -ENOENT) {
         info->free_noent++;
         atomic_long_dec(&info->ctx->active_allocs);
@@ -760,10 +764,18 @@ static int test_page_lifecycle(remote_numa_client_cache_t *cache, unsigned long 
     // Clean up all allocated pages to avoid filling the cache across test runs
     printk(KERN_INFO "[TEST] Freeing all %d allocated pages...\n", TOTAL_TEST_PAGES);
     for (int i = 0; i < TOTAL_TEST_PAGES; i++) {
-        /* Simulate atomic context as in kernel page fault handler */
-        preempt_disable();
-        ret = remote_numa_client_cache_free_page(cache, pages[i]);
-        preempt_enable();
+        /*
+		 * Simulate atomic context as in kernel page fault handler.
+		 * If a free races an in-flight transfer, reject (-EAGAIN) and retry.
+		 */
+		for (int tries = 0; tries < 256; tries++) {
+			preempt_disable();
+			ret = remote_numa_client_cache_free_page(cache, pages[i]);
+			preempt_enable();
+			if (ret != -EAGAIN)
+				break;
+			msleep(1);
+		}
         if (ret && ret != -ENOENT) {
             printk(KERN_WARNING "[TEST] Failed to free page %d: error %d\n", i, ret);
         }

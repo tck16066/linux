@@ -28,6 +28,8 @@ typedef struct remote_numa_known_page {
 	u64 donor_pg_cookie;
 	u32 donor_id;
 	u32 donor_cookie;
+	u64 main_pg_cookie;
+	atomic_t evict_in_progress; /* non-zero while async eviction owns this page */
 	struct hlist_node node; /* for hash table linkage */
 } remote_numa_known_page_t;
 

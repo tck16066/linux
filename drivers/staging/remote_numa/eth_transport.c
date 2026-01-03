@@ -318,8 +318,8 @@ static remote_numa_send_ret_t remote_numa_eth_tx_advert(remote_numa_trprt_ctx_t 
 	payload_start->max_frame_len = max_payload_len();
 	
 	remote_numa_msg_hdr_t *hdr = &payload_start->hdr;
-	hdr->version = remote_numa_eth_advert;
-	hdr->type = remote_numa_protocol_0_1;
+	hdr->version = remote_numa_protocol_0_1;
+	hdr->type = remote_numa_eth_advert;
 	hdr->main_cookie = 0;
 	hdr->donor_cookie = 0;
 
