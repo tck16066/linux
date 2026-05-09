@@ -178,3 +178,6 @@ sphinx_*/
 
 # Rust analyzer configuration
 /rust-project.json
+
+# VS Code workspace
+/drivers/staging/remote_numa/linux.code-workspace

@@ -18,6 +18,15 @@ enum remote_numa_msg_type
 
 	remote_numa_mem_query = 20,
 	remote_numa_mem_resp,
+	remote_numa_mem_alloc,
+	remote_numa_mem_sat_ack,
+	remote_numa_mem_refetch,
+	remote_numa_mem_refetch_sat,
+	remote_numa_mem_refetch_ack,
+	remote_numa_mem_sync,
+	remote_numa_mem_sync_ack,
+	remote_numa_mem_free,
+	remote_numa_mem_free_ack,
 };
 
 enum remote_numa_protocol_version
@@ -26,8 +35,8 @@ enum remote_numa_protocol_version
 };
 
 typedef struct {
-	u8   version : 6;
-	u16  type : 10;
+	u8  version;
+	u8  type;
 	u16  reserved;
 	u32  main_cookie;
 	u32  donor_cookie;
@@ -58,10 +67,69 @@ typedef struct
 typedef struct
 {
 	remote_numa_msg_hdr_t hdr;
-	u8                    total_pages_rank;
 	u8                    page_size_rank;
-	u16                   reserved;
+	u32                   reserved : 24;
 	u32                   free_pages;
 } __attribute__((__packed__)) remote_numa_mem_resp_t;
 
+typedef struct
+{
+	remote_numa_msg_hdr_t hdr;
+	u64 main_pg_cookie;
+	int hack;
+} __attribute__((__packed__)) remote_numa_mem_alloc_t;
+
+typedef enum
+{
+	remote_numa_xfer_end_of_pg = 2,
+} remote_numa_mem_pg_xfer_flags_t;
+
+typedef struct
+{
+	remote_numa_msg_hdr_t hdr;
+	u8  flags;
+	u8 reserved;
+	u16 reserved2;
+	u16 payload_len;
+	u16 seq_num;
+	u64 sender_pg_cookie;
+	u64 receiver_pg_cookie;
+	int hack;
+} __attribute__((__packed__)) remote_numa_mem_pg_xfer_t;
+
+typedef struct {
+	remote_numa_msg_hdr_t hdr;
+	u64 donor_pg_cookie;
+	u64 main_pg_cookie;
+} __attribute__((__packed__)) remote_numa_mem_refetch_t;
+
+typedef struct {
+	remote_numa_msg_hdr_t hdr;
+	u64 main_pg_cookie;
+	u64 donor_pg_cookie;
+	int hack;
+} __attribute__((__packed__)) remote_numa_mem_satisfaction_t;
+
+typedef struct
+{
+	remote_numa_msg_hdr_t hdr;
+	u16 bottom_seq_num;
+	u16 top_seq_num;
+	u64 sender_pg_cookie;
+	u64 receiver_pg_cookie;
+	int hack;
+} __attribute__((__packed__)) remote_numa_mem_pg_xfer_ack_t;
+
+typedef struct
+{
+	remote_numa_msg_hdr_t hdr;
+	u64 donor_pg_cookie;
+	u64 main_pg_cookie;
+} __attribute__((__packed__)) remote_numa_mem_free_t;
+
+typedef struct
+{
+	remote_numa_msg_hdr_t hdr;
+	u64 main_pg_cookie;
+} __attribute__((__packed__)) remote_numa_mem_free_ack_t;
 #endif

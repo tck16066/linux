@@ -111,3 +111,8 @@ void remote_numa_worker_pool_set_reject(bool reject)
 	WRITE_ONCE(rejecting_work, reject);
 }
 
+EXPORT_SYMBOL_GPL(remote_numa_submit_frame);
+EXPORT_SYMBOL_GPL(remote_numa_worker_pool_init);
+EXPORT_SYMBOL_GPL(remote_numa_worker_pool_stop);
+EXPORT_SYMBOL_GPL(remote_numa_worker_pool_set_reject);
+

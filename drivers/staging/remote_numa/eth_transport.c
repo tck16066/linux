@@ -9,11 +9,11 @@
 #include <linux/hashtable.h>
 #include <linux/if.h> 
 #include <linux/if_ether.h>
+#include <linux/jhash.h>
 #include <linux/kernel.h>
 #include <linux/netdevice.h>
 #include <linux/net_custom_hook.h>
 #include <linux/rcupdate.h>
-#include <linux/siphash.h>
 #include <linux/skbuff.h>
 #include <linux/slab.h>
 #include <linux/string.h>
@@ -25,7 +25,7 @@
 #include "worker_pool.h"
 
 #define REMOTE_NUMA_IF_NAME "eth0"
-#define REMOTE_NUMA_MAX_DATA_LEN 1500
+#define REMOTE_NUMA_MAX_DATA_LEN 1400
 
 #define REMOTE_NUMA_ALLOC_TRPRT_CTX(ptr, type, err_label, __mem)			\
 	do {								\
@@ -45,7 +45,18 @@
 	} while (0)
 
 
-static siphash_key_t net_secret;
+static u32 mac_to_node_id(const u8 *mac)
+{
+	u32 id;
+
+	if (!mac)
+		return 0;
+	/* Deterministic mapping across nodes; collisions are possible but rare. */
+	id = jhash(mac, ETH_ALEN, 0);
+	if (id == 0)
+		id = 1;
+	return id;
+}
 
 static const u8 REMOTE_NUMA_SERVICE_MAC[ETH_ALEN] = {
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
@@ -54,13 +65,17 @@ static const u8 REMOTE_NUMA_SERVICE_MAC[ETH_ALEN] = {
 struct remote_numa_eth_trprt_ctx
 {
 	const char *if_name;
-	u16 max_data_len;
 };
 
 typedef struct
 {
 	u8 return_mac_addr[ETH_ALEN];
 } remote_numa_eth_priv_ret_info_t;
+
+static u16 max_payload_len(void)
+{
+	return REMOTE_NUMA_MAX_DATA_LEN;
+}
 
 static void free_rx_buff(void *buff)
 {
@@ -70,7 +85,9 @@ static void free_rx_buff(void *buff)
 
 static custom_net_hook_ret_t eth_skb_handler(struct sk_buff *skb)
 {
-	if (skb->protocol != REMOTE_NUMA_ETHERTYPE)
+	const struct ethhdr *eh = skb_mac_header_was_set(skb) ? eth_hdr(skb) : NULL;
+
+	if (eh->h_proto != REMOTE_NUMA_ETHERTYPE)
 		return custom_net_hook_not_consumed;
 
 	if (remote_numa_submit_frame(skb)) {
@@ -81,19 +98,18 @@ static custom_net_hook_ret_t eth_skb_handler(struct sk_buff *skb)
 	return custom_net_hook_consumed;
 }
 
-static void* setup_skb(struct sk_buff *txskb, size_t payload_len)
+static void *setup_skb(struct sk_buff *skb, size_t total_payload_len)
 {
-	skb_reserve(txskb, NET_IP_ALIGN + sizeof(struct ethhdr));
+	skb_reserve(skb, NET_IP_ALIGN + sizeof(struct ethhdr));
 
-	// Ethernet requires minimum 46-byte payload
-	size_t padded_len = payload_len < 46 ? 46 : payload_len;
+	// Make sure we satisfy Ethernet minimum (46) after MH
+	size_t padded_len = total_payload_len < 46 ? 46 : total_payload_len;
+	skb_put(skb, padded_len);
 
-	void *data = skb_put(txskb, padded_len);
+	skb_push(skb, sizeof(struct ethhdr));
+	skb_reset_mac_header(skb);
 
-	skb_push(txskb, sizeof(struct ethhdr));
-	skb_reset_mac_header(txskb);
-
-	return data;
+	return skb->data + sizeof(struct ethhdr);
 }
 
 static void alloc_tx_buffer(size_t payload_len, void **obj, void**payload_start)
@@ -174,8 +190,6 @@ void remote_numa_clean_donor_trprt_if(remote_numa_donor_trprt_if_t *iface)
 
 void remote_numa_clean_main_trprt_if(remote_numa_main_trprt_if_t *iface)
 {
-	get_random_bytes(&net_secret, sizeof(net_secret));
-
 	// TODO make a cleaner function in the if for the ctx, then move this
 	// calling function to transport.c
 	rcu_assign_pointer(custom_net_hook, NULL);
@@ -192,18 +206,25 @@ void remote_numa_clean_main_trprt_if(remote_numa_main_trprt_if_t *iface)
 
 static u32 advert_to_node_id(remote_numa_advert_t *ad)
 {
-	/*
- 	 * Cast is ok because we know that this advert type is only sent by this
- 	 * transport type (or we would once we got an auth model working!).
- 	 */
-	return hsiphash(ad->return_info.abstract_info,
-		ETH_ALEN, (const hsiphash_key_t *) &net_secret);
+	return mac_to_node_id(ad->return_info.abstract_info);
 }
 
 static u32 mem_query_to_node_id(remote_numa_mem_query_t *mem)
 {
-	return hsiphash(mem->return_info.abstract_info,
-		ETH_ALEN, (const hsiphash_key_t *) &net_secret);
+	return mac_to_node_id(mem->return_info.abstract_info);
+}
+
+static u32 rx_skb_to_node_id(void *rx_data, void *payload)
+{
+	struct sk_buff *skb = rx_data;
+	struct ethhdr *eth;
+
+	if (!skb)
+		return 0;
+	eth = eth_hdr(skb);
+	if (!eth)
+		return 0;
+	return mac_to_node_id(eth->h_source);
 }
 
 static remote_numa_send_ret_t send_msg(struct remote_numa_eth_trprt_ctx *ctx,
@@ -234,7 +255,7 @@ static remote_numa_send_ret_t send_msg(struct remote_numa_eth_trprt_ctx *ctx,
 
 	skb->dev = dev;
 	ether_addr_copy(eth->h_source, dev->dev_addr);
-	
+
 	if (0 != dev_queue_xmit(skb))
 	{
 		/*
@@ -265,6 +286,8 @@ static void prepare_rx_buff(void *rx_buff, void **payload)
 {
 
 	struct sk_buff *skb = rx_buff;
+	skb_linearize(skb);
+
 	u8 *pay = skb_mac_header_was_set(skb) ?
 		skb_mac_header(skb) + ETH_HLEN :
 		skb->data + ETH_HLEN;
@@ -292,12 +315,11 @@ static remote_numa_send_ret_t remote_numa_eth_tx_advert(remote_numa_trprt_ctx_t 
 		goto done;
 	}
 	
-	payload_start->max_frame_len =
-	    ((struct remote_numa_eth_trprt_ctx *)trprt_ctx->trprt_ctx)->max_data_len;
+	payload_start->max_frame_len = max_payload_len();
 	
 	remote_numa_msg_hdr_t *hdr = &payload_start->hdr;
-	hdr->version = remote_numa_eth_advert;
-	hdr->type = remote_numa_protocol_0_1;
+	hdr->version = remote_numa_protocol_0_1;
+	hdr->type = remote_numa_eth_advert;
 	hdr->main_cookie = 0;
 	hdr->donor_cookie = 0;
 
@@ -344,10 +366,8 @@ static remote_numa_receive_ret_t remote_numa_eth_rx_mem_resp
 	return REMOTE_NUMA_TRPRT_RET(remote_numa_receive_err_unknown, 0);
 }
 
-remote_numa_donor_trprt_if_t *remote_numa_eth_donor_init(remote_numa_mem_mgr_t *mem)
+remote_numa_donor_trprt_if_t *remote_numa_eth_donor_init(struct remote_numa_mem_mgr *mem)
 {
-	get_random_bytes(&net_secret, sizeof(net_secret));
-
 	remote_numa_donor_trprt_if_t *ptr = kzalloc(sizeof(*ptr), GFP_KERNEL);
 	if (!ptr)
 	{
@@ -357,6 +377,8 @@ remote_numa_donor_trprt_if_t *remote_numa_eth_donor_init(remote_numa_mem_mgr_t *
 
 	ptr->priv_return_info_from_mem_query = eth_priv_return_info_from_mem_query;
 	ptr->remote_numa_node_id = mem_query_to_node_id;
+	ptr->remote_numa_rx_node_id = rx_skb_to_node_id;
+	ptr->get_max_payload_len = max_payload_len;
 	ptr->alloc_tx_buffer = alloc_tx_buffer;
 	ptr->prepare_rx_buff = prepare_rx_buff;
 	ptr->free_rx_buff = free_rx_buff;
@@ -369,8 +391,6 @@ remote_numa_donor_trprt_if_t *remote_numa_eth_donor_init(remote_numa_mem_mgr_t *
 		struct remote_numa_eth_trprt_ctx, err, mem);
 	struct remote_numa_eth_trprt_ctx *eth_ctx = ptr->trprt_ctx->trprt_ctx;
 	eth_ctx->if_name = REMOTE_NUMA_IF_NAME;
-	eth_ctx->max_data_len =
-		REMOTE_NUMA_MAX_DATA_LEN - sizeof(remote_numa_msg_hdr_t);
 
 	rcu_assign_pointer(custom_net_hook, eth_skb_handler);
 
@@ -390,6 +410,7 @@ remote_numa_main_trprt_if_t *remote_numa_eth_main_init(void)
 		goto err;
 	}
 
+	ptr->get_max_payload_len = max_payload_len;
 	ptr->prepare_rx_buff = prepare_rx_buff;
 	ptr->free_rx_buff = free_rx_buff;
 	ptr->alloc_tx_buffer = alloc_tx_buffer;
@@ -404,9 +425,6 @@ remote_numa_main_trprt_if_t *remote_numa_eth_main_init(void)
 		struct remote_numa_eth_trprt_ctx, err, NULL);
 	struct remote_numa_eth_trprt_ctx *eth_ctx = ptr->trprt_ctx->trprt_ctx;
 	eth_ctx->if_name = REMOTE_NUMA_IF_NAME;
-	eth_ctx->max_data_len =
-		REMOTE_NUMA_MAX_DATA_LEN - sizeof(remote_numa_msg_hdr_t);
-
 	rcu_assign_pointer(custom_net_hook, eth_skb_handler);
 
 	return ptr;
