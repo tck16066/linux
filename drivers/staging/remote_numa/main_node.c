@@ -28,7 +28,7 @@ remote_numa_main_trprt_if_t *ctx = NULL;
 remote_numa_client_cache_t *client_cache = NULL;
 EXPORT_SYMBOL(client_cache);
 
-static remote_numa_receive_ret_t rx_wrapper(void *frame)
+static int rx_wrapper(void *frame)
 {
 	void *payload = NULL;
 	ctx->prepare_rx_buff(frame, &payload);

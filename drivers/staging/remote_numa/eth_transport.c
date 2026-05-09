@@ -5,6 +5,7 @@
  * Copyright (C) 2025 Trevor Kemp
  */
 
+#include <linux/errno.h>
 #include <linux/etherdevice.h> 
 #include <linux/hashtable.h>
 #include <linux/if.h> 
@@ -129,7 +130,7 @@ static void alloc_tx_buffer(size_t payload_len, void **obj, void**payload_start)
 	*obj = txskb;
 }
 
-static remote_numa_send_ret_t eth_priv_return_info(
+static int eth_priv_return_info(
 	void *trprt_ctx,
 	remote_numa_main_return_info_t *info)
 {
@@ -137,7 +138,7 @@ static remote_numa_send_ret_t eth_priv_return_info(
 	struct net_device *dev = dev_get_by_name_rcu(&init_net, eth_ctx->if_name);
 	if (!dev)
 	{
-		return REMOTE_NUMA_TRPRT_RET(remote_numa_send_no_if, 3);
+		return -ENODEV;
 	}
 	ether_addr_copy(info->abstract_info, dev->dev_addr);
 
@@ -227,7 +228,7 @@ static u32 rx_skb_to_node_id(void *rx_data, void *payload)
 	return mac_to_node_id(eth->h_source);
 }
 
-static remote_numa_send_ret_t send_msg(struct remote_numa_eth_trprt_ctx *ctx,
+static int send_msg(struct remote_numa_eth_trprt_ctx *ctx,
 				       struct sk_buff *skb,
 				       const u8* dst_mac)
 {
@@ -235,7 +236,7 @@ static remote_numa_send_ret_t send_msg(struct remote_numa_eth_trprt_ctx *ctx,
  	*  list of skb and acquires the lock one time.
  	*/
 
-	remote_numa_send_ret_t ret = 0;
+	int ret = 0;
 
 	struct ethhdr *eth = eth_hdr(skb);
 	ether_addr_copy(eth->h_dest, dst_mac);
@@ -249,7 +250,7 @@ static remote_numa_send_ret_t send_msg(struct remote_numa_eth_trprt_ctx *ctx,
 	struct net_device *dev = dev_get_by_name_rcu(&init_net, ctx->if_name);
 	if (!dev)
 	{
-		ret = REMOTE_NUMA_TRPRT_RET(remote_numa_send_no_if, 1);
+		ret = -ENODEV;
 		goto done;
 	}
 
@@ -264,7 +265,7 @@ static remote_numa_send_ret_t send_msg(struct remote_numa_eth_trprt_ctx *ctx,
  		 * to carefully handle the case of segmented data drops.
  		 */ 
 		skb = NULL;
-		ret = REMOTE_NUMA_TRPRT_RET(remote_numa_send_bad_xmit, 1);
+		ret = -EIO;
 		goto done;
 	}
 	skb = NULL;
@@ -276,7 +277,7 @@ done:
 	return ret;
 }
 
-static remote_numa_send_ret_t tx_msg(remote_numa_trprt_ctx_t *trprt_ctx,
+static int tx_msg(remote_numa_trprt_ctx_t *trprt_ctx,
 	void *return_info, void *msg)
 {
 	return send_msg(trprt_ctx->trprt_ctx, msg, return_info);
@@ -295,13 +296,13 @@ static void prepare_rx_buff(void *rx_buff, void **payload)
 	*payload = pay;
 }
 
-static remote_numa_send_ret_t remote_numa_eth_tx_advert(remote_numa_trprt_ctx_t *trprt_ctx)
+static int remote_numa_eth_tx_advert(remote_numa_trprt_ctx_t *trprt_ctx)
 {
 	/* The error path should not unlock if we did not
  	 * acquire the lock in this function.
  	 */
 	bool took_rcu = false;
-	remote_numa_send_ret_t ret = 0;
+	int ret = 0;
 	struct sk_buff *txskb = NULL;
 	remote_numa_advert_t *payload_start = NULL;
 	void **v_txskb = (void**)&txskb;
@@ -311,7 +312,7 @@ static remote_numa_send_ret_t remote_numa_eth_tx_advert(remote_numa_trprt_ctx_t 
 	
 	if (!txskb)
 	{
-		ret = REMOTE_NUMA_TRPRT_RET(remote_numa_send_bad_alloc, 1);
+		ret = -ENOMEM;
 		goto done;
 	}
 	
@@ -334,7 +335,7 @@ static remote_numa_send_ret_t remote_numa_eth_tx_advert(remote_numa_trprt_ctx_t 
 		dev_get_by_name_rcu(&init_net, ctx->if_name);
 	if (!dev)
 	{
-		ret = REMOTE_NUMA_TRPRT_RET(remote_numa_send_no_if, 2);
+		ret = -ENODEV;
 		goto done;
 	}
 	ether_addr_copy(payload_start->return_info.abstract_info, dev->dev_addr);
@@ -348,22 +349,22 @@ done:
 	return ret;
 }
 
-static remote_numa_receive_ret_t remote_numa_eth_rx_mem_query
+static int remote_numa_eth_rx_mem_query
     (remote_numa_trprt_ctx_t *trprt_ctx, remote_numa_mem_query_t *query)
 {
-	return REMOTE_NUMA_TRPRT_RET(remote_numa_receive_err_unknown, 0);
+	return -EOPNOTSUPP;
 }
 
-static remote_numa_send_ret_t remote_numa_eth_tx_mem_resp
+static int remote_numa_eth_tx_mem_resp
     (remote_numa_trprt_ctx_t *trprt_ctx, remote_numa_mem_resp_t *resp)
 {
-	return REMOTE_NUMA_TRPRT_RET(remote_numa_send_err_unknown, 0);
+	return -EOPNOTSUPP;
 }
 
-static remote_numa_receive_ret_t remote_numa_eth_rx_mem_resp
+static int remote_numa_eth_rx_mem_resp
     (remote_numa_trprt_ctx_t *trprt_ctx, remote_numa_mem_resp_t *resp)
 {
-	return REMOTE_NUMA_TRPRT_RET(remote_numa_receive_err_unknown, 0);
+	return -EOPNOTSUPP;
 }
 
 remote_numa_donor_trprt_if_t *remote_numa_eth_donor_init(struct remote_numa_mem_mgr *mem)

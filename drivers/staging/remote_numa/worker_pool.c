@@ -27,16 +27,14 @@ static int worker_count;
 static rx_func_t handler_fn;
 static bool rejecting_work;
 
-remote_numa_receive_ret_t remote_numa_submit_frame(void *frame)
+int remote_numa_submit_frame(void *frame)
 {
 	if (READ_ONCE(rejecting_work))
-		return REMOTE_NUMA_TRPRT_RET(
-			remote_numa_receive_err_unknown, 10);
+		return -ESHUTDOWN;
 
 	struct worker_job *job = kmalloc(sizeof(*job), GFP_ATOMIC);
 	if (!job)
-		return REMOTE_NUMA_TRPRT_RET(
-			remote_numa_receive_bad_alloc, 10);
+		return -ENOMEM;
 
 	job->frame = frame;
 	llist_add(&job->llnode, &job_list);

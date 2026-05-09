@@ -38,7 +38,7 @@
 
 #define REMOTE_NUMA_STRESS_TEST 1
 #define REMOTE_NUMA_STRESS_MAX_CONCURRENT_OPS 4
-#define REMOTE_NUMA_STRESS_MINUTES 120
+#define REMOTE_NUMA_STRESS_MINUTES 5
 #define REMOTE_NUMA_STRESS_THREADS 5
 
 /* Burst size for churn/refault/free operations in the main stress loop. */

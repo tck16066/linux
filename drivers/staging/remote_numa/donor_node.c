@@ -31,7 +31,7 @@ static struct task_struct *kthread = NULL;
 static remote_numa_donor_trprt_if_t *ctx = NULL;
 static struct remote_numa_mem_mgr *mem;
 
-static remote_numa_receive_ret_t rx_wrapper(void *frame)
+static int rx_wrapper(void *frame)
 {
 	void *payload = NULL;
 	ctx->prepare_rx_buff(frame, &payload);

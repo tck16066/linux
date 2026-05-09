@@ -10,11 +10,11 @@
 
 #include "transport.h"
 
-typedef remote_numa_receive_ret_t (*rx_func_t)(void *);
+typedef int (*rx_func_t)(void *);
 
 int remote_numa_worker_pool_init(rx_func_t handler, int num_workers);
 void remote_numa_worker_pool_stop(void);
-remote_numa_receive_ret_t remote_numa_submit_frame(void *frame);
+int remote_numa_submit_frame(void *frame);
 void remote_numa_worker_pool_set_reject(bool reject);
 
 #endif
