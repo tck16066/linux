@@ -82,7 +82,7 @@ static void alloc_tx_buffer(main_xfer_state_t *xfer,
 			payload_start);
 }
 
-static remote_numa_send_ret_t tx_msg(
+static int tx_msg(
 	main_xfer_state_t *xfer, void *msg)
 {
 	if (xfer->is_main_node)
@@ -106,22 +106,22 @@ static u16 xfer_state_max_payload(
 		return xfer->donor_trprt->get_max_payload_len();
 }
 
-static remote_numa_receive_ret_t remote_numa_rx_mem_pg_refetch(
+static int remote_numa_rx_mem_pg_refetch(
 	struct remote_numa_donor_trprt_if *donor_if,
 	remote_numa_mem_refetch_t *refetch,
 	u32 main_node_id);
 
-static remote_numa_receive_ret_t remote_numa_rx_mem_alloc_from(
+static int remote_numa_rx_mem_alloc_from(
 	remote_numa_donor_trprt_if_t *donor_if,
 	remote_numa_mem_alloc_t *alloc,
 	u32 main_node_id);
 
-static remote_numa_receive_ret_t remote_numa_rx_mem_pg_sync_xfer_from(
+static int remote_numa_rx_mem_pg_sync_xfer_from(
 	remote_numa_donor_trprt_if_t *donor_if,
 	remote_numa_mem_pg_xfer_t *xfer,
 	u32 main_node_id);
 
-static remote_numa_receive_ret_t remote_numa_rx_mem_pg_free_from(
+static int remote_numa_rx_mem_pg_free_from(
 	remote_numa_donor_trprt_if_t *donor_if,
 	remote_numa_mem_free_t *pg_free,
 	u32 main_node_id);
@@ -438,14 +438,14 @@ static void remote_numa_send_all_segments(main_xfer_state_t *xfer, u16 seg_len)
 	}
 }
 
-static remote_numa_receive_ret_t remote_numa_rx_mem_pg_refetch(
+static int remote_numa_rx_mem_pg_refetch(
 	struct remote_numa_donor_trprt_if *donor_if,
 	remote_numa_mem_refetch_t *refetch,
 	u32 main_node_id)
 {
 	struct remote_numa_mem_mgr *mgr = donor_if->trprt_ctx->mem;
 	if (!mgr)
-		return remote_numa_receive_err_unknown;
+		return -EIO;
 
 	void *page_ptr;
 	remote_numa_page_t *rn_pg;
@@ -453,14 +453,14 @@ static remote_numa_receive_ret_t remote_numa_rx_mem_pg_refetch(
 	if (remote_numa_mem_lookup_page(mgr, refetch->donor_pg_cookie,
 	                                 &page_ptr, &rn_pg) != 0)
 	{
-		return remote_numa_receive_bad_cookie;
+		return -ENOENT;
 	}
 	cached_pg = &rn_pg->cached_pg;
 
 	struct page *pg = virt_to_page(page_ptr);
 	if (!pg)
 	{
-		return remote_numa_receive_err_unknown;
+		return -EIO;
 	}
 
 	remote_numa_node_t *main_node = __remote_numa_get_node_locking(
@@ -469,12 +469,12 @@ static remote_numa_receive_ret_t remote_numa_rx_mem_pg_refetch(
 		main_node_id);
 	if (!main_node)
 	{
-		return remote_numa_receive_bad_cookie;
+		return -ENOENT;
 	}
 
 	main_xfer_state_t *xfer = kzalloc(sizeof(*xfer), GFP_KERNEL);
 	if (!xfer)
-		return remote_numa_receive_bad_alloc;
+		return -ENOMEM;
 	refcount_set(&xfer->refcnt, 1);
 
 	// TODO, this is super confusing, need to rename some fields.
@@ -517,10 +517,10 @@ static remote_numa_receive_ret_t remote_numa_rx_mem_pg_refetch(
 		      sizeof(remote_numa_mem_pg_xfer_t);
 	remote_numa_send_all_segments(xfer, seg_len);
 
-	return remote_numa_receive_success;
+	return 0;
 }
 
-remote_numa_send_ret_t remote_numa_transport_alloc_page_async(
+int remote_numa_transport_alloc_page_async(
 	struct remote_numa_main_trprt_if *trprt,
 	remote_numa_node_t *donor,
 	struct remote_numa_cached_page *cached_target)
@@ -535,7 +535,7 @@ remote_numa_send_ret_t remote_numa_transport_alloc_page_async(
 
 	if (!xfer) {
 		printk(KERN_DEBUG "Could not alloc xfer state.\n");
-		return remote_numa_send_bad_alloc;
+		return -ENOMEM;
 	}
 	refcount_set(&xfer->refcnt, 1);
 
@@ -582,7 +582,7 @@ remote_numa_send_ret_t remote_numa_transport_alloc_page_async(
 		hash_del(&xfer->node);
 		spin_unlock(&hacky_spinlock);
 		xfer_put(xfer);
-		return remote_numa_send_bad_alloc;
+		return -ENOMEM;
 	}
 
 	req->hdr.version = remote_numa_protocol_0_1;
@@ -597,14 +597,14 @@ remote_numa_send_ret_t remote_numa_transport_alloc_page_async(
 		hash_del(&xfer->node);
 		spin_unlock(&hacky_spinlock);
 		xfer_put(xfer);
-		return remote_numa_send_bad_xmit;
+		return -EIO;
 	}
 
 	/* Return immediately - caller must check completion later */
-	return remote_numa_send_success;
+	return 0;
 }
 
-remote_numa_send_ret_t remote_numa_transport_refetch_page_async(
+int remote_numa_transport_refetch_page_async(
 	struct remote_numa_main_trprt_if *trprt,
 	u32 donor_node_id,
 	u64 donor_pg_cookie,
@@ -623,11 +623,11 @@ remote_numa_send_ret_t remote_numa_transport_refetch_page_async(
 	rcu_read_unlock();
 
 	if (!donor)
-		return remote_numa_send_no_if;
+		return -ENODEV;
 
 	main_xfer_state_t *xfer = kzalloc(sizeof(*xfer), GFP_ATOMIC);
 	if (!xfer)
-		return remote_numa_send_bad_alloc;
+		return -ENOMEM;
 	refcount_set(&xfer->refcnt, 1);
 
 	xfer->cached_pg = cached_target;
@@ -664,7 +664,7 @@ remote_numa_send_ret_t remote_numa_transport_refetch_page_async(
 		hash_del(&xfer->node);
 		spin_unlock(&hacky_spinlock);
 		xfer_put(xfer);
-		return remote_numa_send_bad_alloc;
+		return -ENOMEM;
 	}
 
 	refetch->hdr.version       = remote_numa_protocol_0_1;
@@ -679,31 +679,31 @@ remote_numa_send_ret_t remote_numa_transport_refetch_page_async(
 		hash_del(&xfer->node);
 		spin_unlock(&hacky_spinlock);
 		xfer_put(xfer);
-		return remote_numa_send_bad_xmit;
+		return -EIO;
 	}
 
 	/* Return immediately - caller polls for completion */
-	return remote_numa_send_success;
+	return 0;
 }
 
-remote_numa_receive_ret_t remote_numa_rx_mem_pg_sync_xfer(
+int remote_numa_rx_mem_pg_sync_xfer(
 	remote_numa_donor_trprt_if_t *donor_if,
 	remote_numa_mem_pg_xfer_t *xfer)
 {
 	return remote_numa_rx_mem_pg_sync_xfer_from(donor_if, xfer, xfer->hdr.donor_cookie);
 }
 
-static remote_numa_receive_ret_t remote_numa_rx_mem_pg_sync_xfer_from(
+static int remote_numa_rx_mem_pg_sync_xfer_from(
 	remote_numa_donor_trprt_if_t *donor_if,
 	remote_numa_mem_pg_xfer_t *xfer,
 	u32 main_node_id)
 {
 	struct remote_numa_mem_mgr *mgr = donor_if->trprt_ctx->mem;
 	if (!mgr)
-		return remote_numa_receive_err_unknown;
+		return -EIO;
 
 	if (xfer->payload_len + xfer->seq_num > PAGE_SIZE)
-		return remote_numa_receive_out_of_bounds;
+		return -EOVERFLOW;
 
 	/*
 	 * Best-effort sync: if the receiver cookie is unknown or the page has
@@ -729,7 +729,7 @@ static remote_numa_receive_ret_t remote_numa_rx_mem_pg_sync_xfer_from(
 
 	donor_if->alloc_tx_buffer(sizeof(*ack), &ack_buf, v);
 	if (!ack_buf || !ack)
-		return remote_numa_receive_bad_alloc;
+		return -ENOMEM;
 
 	ack->hdr.version        = remote_numa_protocol_0_1;
 	ack->hdr.type           = remote_numa_mem_sync_ack;
@@ -746,18 +746,18 @@ static remote_numa_receive_ret_t remote_numa_rx_mem_pg_sync_xfer_from(
 		REMOTE_NUMA_HASH_TABLE_ORDER,
 		main_node_id);
 	if (!main_node)
-		return remote_numa_receive_bad_cookie;
+		return -ENOENT;
 
 	int ret = donor_if->tx_msg(donor_if->trprt_ctx,
 	                        main_node->priv_return_info,
 	                        ack_buf) == 0
-	       ? remote_numa_receive_success
-	       : remote_numa_receive_err_unknown;
+	       ? 0
+	       : -EIO;
 
 	return ret;
 }
 
-remote_numa_receive_ret_t remote_numa_rx_mem_pg_sat_ack(
+int remote_numa_rx_mem_pg_sat_ack(
 	struct remote_numa_main_trprt_if *main_if,
 	remote_numa_mem_satisfaction_t *ack)
 {
@@ -769,13 +769,13 @@ remote_numa_receive_ret_t remote_numa_rx_mem_pg_sat_ack(
 	 *   main side has already timed out or retired the xfer.
 	 */
 	if (!xfer) {
-		return remote_numa_receive_success;
+		return 0;
 	}
 	if (ack->hack != xfer->hack) {
 		pr_debug("remote_numa: sat_ack hack mismatch main_cookie=%llu xfer_hack=%d ack_hack=%d\n",
 			 ack->main_pg_cookie, xfer->hack, ack->hack);
 		xfer_put(xfer);
-		return remote_numa_receive_success;
+		return 0;
 	}
 
 	/* mark done and publish donor cookie */
@@ -786,17 +786,17 @@ remote_numa_receive_ret_t remote_numa_rx_mem_pg_sat_ack(
 	spin_unlock(&hacky_spinlock);
 	wake_up(&xfer->waitq);
 	xfer_put(xfer);
-	return remote_numa_receive_success;
+	return 0;
 }
 
-remote_numa_receive_ret_t remote_numa_rx_mem_pg_sync_ack(
+int remote_numa_rx_mem_pg_sync_ack(
 	struct remote_numa_main_trprt_if *main_if,
 	remote_numa_mem_pg_xfer_ack_t *ack)
 {
 	main_xfer_state_t *xfer = xfer_get(ack->receiver_pg_cookie);
 
 	if (!xfer)
-		return remote_numa_receive_bad_cookie;
+		return -ENOENT;
 
 	bitmap_set(xfer->received_bitmap, ack->bottom_seq_num,
 		ack->top_seq_num - ack->bottom_seq_num);
@@ -806,27 +806,27 @@ remote_numa_receive_ret_t remote_numa_rx_mem_pg_sync_ack(
 		wake_up(&xfer->waitq);
 	}
 	xfer_put(xfer);
-	return remote_numa_receive_success;
+	return 0;
 }
 
-remote_numa_send_ret_t remote_numa_tx_mem_pg_sync_xfer_async(
+int remote_numa_tx_mem_pg_sync_xfer_async(
 	struct remote_numa_main_trprt_if *main_if,
 	u64 donor_pg_cookie,
 	struct page *pg,
 	struct remote_numa_cached_page *victim)
 {
 	if (!main_if || !pg || !victim)
-		return remote_numa_send_err_unknown;
+		return -EIO;
 	remote_numa_node_t *donor = __remote_numa_get_node_locking(
 		main_if->trprt_ctx->node_table,
 		REMOTE_NUMA_HASH_TABLE_ORDER,
 				victim->known_page->donor_id);
 	if (!donor)
-		return remote_numa_send_no_if;
+		return -ENODEV;
 
 	main_xfer_state_t *xfer = kzalloc(sizeof(*xfer), GFP_ATOMIC);
 	if (!xfer)
-		return remote_numa_send_bad_alloc;
+		return -ENOMEM;
 	refcount_set(&xfer->refcnt, 1);
 
 	spin_lock(&hacky_spinlock);
@@ -857,7 +857,7 @@ remote_numa_send_ret_t remote_numa_tx_mem_pg_sync_xfer_async(
 	remote_numa_send_all_segments(xfer, seg_len);
 
 	/* Return immediately - transfer will complete async */
-	return remote_numa_send_success;
+	return 0;
 }
 
 /* Check if transfer is complete. Returns 0 if done, -EAGAIN if in progress, <0 on error */
@@ -934,16 +934,16 @@ void remote_numa_transport_ctx_destroy(remote_numa_trprt_ctx_t *ctx)
 	kfree(ctx);
 }
 
-remote_numa_receive_ret_t remote_numa_main_rx(
+int remote_numa_main_rx(
 	remote_numa_main_trprt_if_t *main_if, void *rx_data, void *payload)
 {
-	remote_numa_receive_ret_t ret = 0;
+	int ret = 0;
 	u8 hdr_type = 0;
 
 	remote_numa_msg_hdr_t *hdr = payload;
 	if (hdr->version != REMOTE_NUMA_SUPPORTED_PROTO)
 	{
-		ret = REMOTE_NUMA_TRPRT_RET(remote_numa_receive_bad_proto, 1);
+		ret = -EPROTO;
 		goto done;
 	}
 	hdr_type = hdr->type;
@@ -969,7 +969,7 @@ remote_numa_receive_ret_t remote_numa_main_rx(
 		ret = remote_numa_rx_mem_pg_refetch_sat(main_if, payload);
 		goto done;
 	default:
-		ret = REMOTE_NUMA_TRPRT_RET(remote_numa_receive_mangled_pkt, 1);
+		ret = -EBADMSG;
 		printk(KERN_WARNING "error processing pkt... unknown type\n");
 		goto done;
 	}
@@ -983,10 +983,10 @@ done:
 	return ret;
 }
 
-remote_numa_receive_ret_t remote_numa_donor_rx(
+int remote_numa_donor_rx(
 	remote_numa_donor_trprt_if_t *donor_if, void *rx_data, void *payload)
 {
-	remote_numa_receive_ret_t ret = 0;
+	int ret = 0;
 	u32 src_node_id = 0;
 	u8 hdr_type = 0;
 
@@ -996,7 +996,7 @@ remote_numa_receive_ret_t remote_numa_donor_rx(
 	remote_numa_msg_hdr_t *hdr = payload;
 	if (hdr->version != REMOTE_NUMA_SUPPORTED_PROTO)
 	{
-		ret = REMOTE_NUMA_TRPRT_RET(remote_numa_receive_bad_proto, 1);
+		ret = -EPROTO;
 		goto done;
 	}
 	hdr_type = hdr->type;
@@ -1022,7 +1022,7 @@ remote_numa_receive_ret_t remote_numa_donor_rx(
 		ret = remote_numa_rx_mem_pg_refetch_ack(donor_if, payload);
 		goto done;
 	default:
-		ret = REMOTE_NUMA_TRPRT_RET(remote_numa_receive_mangled_pkt, 1);
+		ret = -EBADMSG;
 		printk(KERN_WARNING "error processing pkt... unknown type\n");
 		goto done;
 	}
@@ -1037,7 +1037,7 @@ done:
 	return ret;
 }
 
-remote_numa_receive_ret_t remote_numa_rx_advert(
+int remote_numa_rx_advert(
 	remote_numa_main_trprt_if_t *main_if,
 	remote_numa_advert_t *advert)
 {
@@ -1051,7 +1051,7 @@ remote_numa_receive_ret_t remote_numa_rx_advert(
 		advert);
 
 	if (!node)
-		return REMOTE_NUMA_TRPRT_RET(remote_numa_receive_bad_alloc, 5);
+		return -ENOMEM;
 	void *tx_buffer_start;
 	remote_numa_mem_query_t *query;
 	void **v_query = (void **)&query;
@@ -1060,7 +1060,7 @@ remote_numa_receive_ret_t remote_numa_rx_advert(
 	if (tx_buffer_start == NULL || query == NULL)
 	{
 		// TODO make file id for each return code to use.
-		return REMOTE_NUMA_TRPRT_RET(remote_numa_send_bad_alloc, 1);
+		return -ENOMEM;
 	}
 	query->hdr.version = remote_numa_protocol_0_1;
 	query->hdr.type = remote_numa_mem_query;
@@ -1075,10 +1075,10 @@ remote_numa_receive_ret_t remote_numa_rx_advert(
  	 */	
 	return main_if->tx_msg(main_if->trprt_ctx,
 		node->priv_return_info, tx_buffer_start) == 0 ?
-		0 : REMOTE_NUMA_TRPRT_RET(remote_numa_receive_err_unknown, 1);
+		0 : -EIO;
 }
 
-remote_numa_receive_ret_t remote_numa_rx_mem_query(
+int remote_numa_rx_mem_query(
 	remote_numa_donor_trprt_if_t *donor_if,
 	remote_numa_mem_query_t *query)
 {
@@ -1093,7 +1093,7 @@ remote_numa_receive_ret_t remote_numa_rx_mem_query(
 		query);
 
 	if (!node)
-		return REMOTE_NUMA_TRPRT_RET(remote_numa_receive_bad_alloc, 6);
+		return -ENOMEM;
 
 	void *tx_buffer_start;
 	remote_numa_mem_resp_t *resp;
@@ -1103,7 +1103,7 @@ remote_numa_receive_ret_t remote_numa_rx_mem_query(
 	if (tx_buffer_start == NULL || resp == NULL)
 	{
 		// TODO make file id for each return code to use.
-		return REMOTE_NUMA_TRPRT_RET(remote_numa_send_bad_alloc, 2);
+		return -ENOMEM;
 	}
 	resp->hdr.version = remote_numa_protocol_0_1;
 	resp->hdr.type = remote_numa_mem_resp;
@@ -1122,10 +1122,10 @@ remote_numa_receive_ret_t remote_numa_rx_mem_query(
  	 */	
 	return donor_if->tx_msg(donor_if->trprt_ctx,
 		node->priv_return_info, tx_buffer_start) == 0 ?
-		0 : REMOTE_NUMA_TRPRT_RET(remote_numa_receive_err_unknown, 2);
+		0 : -EIO;
 }
 
-remote_numa_receive_ret_t remote_numa_rx_mem_resp(
+int remote_numa_rx_mem_resp(
 	remote_numa_main_trprt_if_t *main_if,
 	remote_numa_mem_resp_t *resp)
 {
@@ -1142,14 +1142,14 @@ remote_numa_receive_ret_t remote_numa_rx_mem_resp(
 	return 0;
 }
 
-remote_numa_receive_ret_t remote_numa_rx_mem_alloc(
+int remote_numa_rx_mem_alloc(
 	remote_numa_donor_trprt_if_t *donor_if,
 	remote_numa_mem_alloc_t *alloc)
 {
 	return remote_numa_rx_mem_alloc_from(donor_if, alloc, alloc->hdr.donor_cookie);
 }
 
-static remote_numa_receive_ret_t remote_numa_rx_mem_alloc_from(
+static int remote_numa_rx_mem_alloc_from(
 	remote_numa_donor_trprt_if_t *donor_if,
 	remote_numa_mem_alloc_t *alloc,
 	u32 main_node_id)
@@ -1160,12 +1160,12 @@ static remote_numa_receive_ret_t remote_numa_rx_mem_alloc_from(
 
     if (!mgr) {
         printk(KERN_DEBUG "No mem manager in donor.\n");
-        return remote_numa_receive_err_unknown;
+		return -EIO;
     }
 
     if (remote_numa_mem_alloc_page(mgr, &cookie, &page) != 0) {
         printk(KERN_DEBUG "Bad page alloc manager in donor.\n");
-        return remote_numa_receive_bad_alloc;
+		return -ENOMEM;
     }
 
     void *tx_buf;
@@ -1176,7 +1176,7 @@ static remote_numa_receive_ret_t remote_numa_rx_mem_alloc_from(
     if (!tx_buf || !ack) {
         printk(KERN_DEBUG "Bad tx alloc manager in donor.\n");
         remote_numa_mem_free_page(mgr, cookie); // Return page to pool
-        return remote_numa_receive_bad_alloc;
+		return -ENOMEM;
     }
 
     ack->hdr.version = remote_numa_protocol_0_1;
@@ -1192,25 +1192,25 @@ static remote_numa_receive_ret_t remote_numa_rx_mem_alloc_from(
 		REMOTE_NUMA_HASH_TABLE_ORDER,
 		main_node_id);
 	if (!main_node)
-		return remote_numa_receive_bad_cookie;
+		return -ENOENT;
 
     // Send the ack
     return donor_if->tx_msg(
                donor_if->trprt_ctx,
                main_node->priv_return_info,
                tx_buf) == 0
-           ? remote_numa_receive_success
-           : remote_numa_receive_err_unknown;
+	       ? 0
+	       : -EIO;
 }
 
-remote_numa_receive_ret_t remote_numa_rx_mem_pg_free(
+int remote_numa_rx_mem_pg_free(
 	remote_numa_donor_trprt_if_t *donor_if,
 	remote_numa_mem_free_t *pg_free)
 {
 	return remote_numa_rx_mem_pg_free_from(donor_if, pg_free, pg_free->hdr.donor_cookie);
 }
 
-static remote_numa_receive_ret_t remote_numa_rx_mem_pg_free_from(
+static int remote_numa_rx_mem_pg_free_from(
 	remote_numa_donor_trprt_if_t *donor_if,
 	remote_numa_mem_free_t *pg_free,
 	u32 main_node_id)
@@ -1236,7 +1236,7 @@ static remote_numa_receive_ret_t remote_numa_rx_mem_pg_free_from(
 
 	donor_if->alloc_tx_buffer(sizeof(*ack), &tx_buf, v);
 	if (!tx_buf || !ack)
-		return remote_numa_receive_bad_alloc;
+		return -ENOMEM;
 
 	ack->hdr.version        = remote_numa_protocol_0_1;
 	ack->hdr.type           = remote_numa_mem_free_ack;
@@ -1249,17 +1249,17 @@ static remote_numa_receive_ret_t remote_numa_rx_mem_pg_free_from(
 		REMOTE_NUMA_HASH_TABLE_ORDER,
 		main_node_id);
 	if (!main_node)
-		return remote_numa_receive_bad_cookie;
+		return -ENOENT;
 
 	return donor_if->tx_msg(donor_if->trprt_ctx,
 	                        main_node->priv_return_info,
 	                        tx_buf) == 0
-	       ? remote_numa_receive_success
-	       : remote_numa_receive_err_unknown;
+	       ? 0
+	       : -EIO;
 }
 
 
-remote_numa_receive_ret_t remote_numa_rx_mem_pg_free_ack(
+int remote_numa_rx_mem_pg_free_ack(
 	remote_numa_main_trprt_if_t *main_if,
 	remote_numa_mem_free_ack_t *ack)
 {
@@ -1270,16 +1270,16 @@ remote_numa_receive_ret_t remote_numa_rx_mem_pg_free_ack(
 	 */
 	main_xfer_state_t *xfer = xfer_get(ack->main_pg_cookie);
 	if (!xfer)
-		return remote_numa_receive_success;
+		return 0;
 
 	bitmap_fill(xfer->received_bitmap, PAGE_SIZE);
 	wake_up(&xfer->waitq);
 	xfer_put(xfer);
 
-	return remote_numa_receive_success;
+	return 0;
 }
 
-remote_numa_send_ret_t remote_numa_tx_mem_pg_free(
+int remote_numa_tx_mem_pg_free(
 	struct remote_numa_main_trprt_if *main_if,
 	u32 donor_id,
 	u64 donor_pg_cookie,
@@ -1295,7 +1295,7 @@ remote_numa_send_ret_t remote_numa_tx_mem_pg_free(
 	rcu_read_unlock();
 
 	if (!donor)
-		return remote_numa_send_no_if;
+		return -ENODEV;
 
 	/* Fire-and-forget FREE: no xfer_table entry, no wait on ACK. */
 	void *tx_buf;
@@ -1304,7 +1304,7 @@ remote_numa_send_ret_t remote_numa_tx_mem_pg_free(
 
 	main_if->alloc_tx_buffer(sizeof(*msg), &tx_buf, v);
 	if (!tx_buf || !msg)
-		return remote_numa_send_bad_alloc;
+		return -ENOMEM;
 
 	msg->hdr.version        = remote_numa_protocol_0_1;
 	msg->hdr.type           = remote_numa_mem_free;
@@ -1314,24 +1314,24 @@ remote_numa_send_ret_t remote_numa_tx_mem_pg_free(
 	msg->main_pg_cookie     = main_pg_cookie;
 
 	if (main_if->tx_msg(main_if->trprt_ctx, donor->priv_return_info, tx_buf))
-		return remote_numa_send_bad_xmit;
+		return -EIO;
 
-	return remote_numa_send_success;
+	return 0;
 }
 
-remote_numa_receive_ret_t remote_numa_rx_mem_pg_refetch_sat(
+int remote_numa_rx_mem_pg_refetch_sat(
     remote_numa_main_trprt_if_t *main_if,
     remote_numa_mem_pg_xfer_t *sat)
 {
 	main_xfer_state_t *xfer = xfer_get(sat->receiver_pg_cookie);
     if (!xfer)
     {
-	return remote_numa_receive_bad_cookie;
+	return -ENOENT;
     }
     if (sat->payload_len + sat->seq_num > PAGE_SIZE)
 	{
 		xfer_put(xfer);
-		return remote_numa_receive_out_of_bounds;
+		return -EOVERFLOW;
 	}
 
     /* write segment into local page */
@@ -1348,7 +1348,7 @@ remote_numa_receive_ret_t remote_numa_rx_mem_pg_refetch_sat(
     main_if->alloc_tx_buffer(sizeof(*ack), &ack_buf, v);
 	if (!ack_buf || !ack) {
 		xfer_put(xfer);
-		return remote_numa_receive_bad_alloc;
+		return -ENOMEM;
 	}
 
     ack->hdr.version        = REMOTE_NUMA_SUPPORTED_PROTO;
@@ -1369,7 +1369,7 @@ remote_numa_receive_ret_t remote_numa_rx_mem_pg_refetch_sat(
     if (!donor) {
         printk(KERN_ERR "refetch_sat: failed to find donor node %u\n", sat->hdr.main_cookie);
 		xfer_put(xfer);
-        return remote_numa_receive_bad_cookie;
+		return -ENOENT;
     }
 
     /* send ACK back to donor */
@@ -1386,23 +1386,23 @@ remote_numa_receive_ret_t remote_numa_rx_mem_pg_refetch_sat(
 	        xfer_put(xfer);
 	}
 
-    return remote_numa_receive_success;
+	return 0;
 }
 
-remote_numa_receive_ret_t
+int
 remote_numa_rx_mem_pg_refetch_ack(struct remote_numa_donor_trprt_if *donor_if,
                                   remote_numa_mem_pg_xfer_ack_t *ack)
 {
 	main_xfer_state_t *xfer = xfer_get(ack->receiver_pg_cookie);
     if (!xfer)
-        return remote_numa_receive_bad_cookie;
+		return -ENOENT;
 
     /* Stale in-flight? Keep behavior consistent with sync_ack: log and continue. */
     if (ack->hack != xfer->hack) {
         printk(KERN_INFO "Ignoring refetch_ack due to hack staleness (expected %d, got %d)\n",
                xfer->hack, ack->hack);
 		xfer_put(xfer);
-        return remote_numa_receive_success;  // Silently ignore stale acks
+		return 0;  // Silently ignore stale acks
     }
 
     /* Range-based ACK: handle out-of-order arrivals without over-marking. */
@@ -1418,7 +1418,7 @@ remote_numa_rx_mem_pg_refetch_ack(struct remote_numa_donor_trprt_if *donor_if,
 	        xfer_put(xfer);
 	}
 
-    return remote_numa_receive_success;
+	return 0;
 }
 
 void tmp_init(void)
