@@ -21,8 +21,14 @@
 #include "worker_pool.h"
 
 #define WORKER_POOL_SIZE 4
-//#define REMOTE_NUMA_MAX_CACHED_PGS 128000
-#define REMOTE_NUMA_MAX_CACHED_PGS 1200
+
+/*
+ * Client cache capacity (pages), settable at insmod time. The stress test's
+ * total working set must exceed this to exercise eviction/refault.
+ */
+static int max_cached_pages = 1500;
+module_param(max_cached_pages, int, 0644);
+MODULE_PARM_DESC(max_cached_pages, "client cache capacity in pages");
 
 remote_numa_main_trprt_if_t *ctx = NULL;
 remote_numa_client_cache_t *client_cache = NULL;
@@ -57,7 +63,7 @@ remote_numa_main_node_init(void)
 	if ((cache_init = remote_numa_client_cache_init(
 		client_cache,
 		ctx,
-		REMOTE_NUMA_MAX_CACHED_PGS)))
+		max_cached_pages)))
 	{
 		printk(KERN_ERR "Could not init client cache.");
 		return cache_init;

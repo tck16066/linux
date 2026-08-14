@@ -37,7 +37,9 @@ typedef struct remote_numa_cached_page {
 	struct remote_numa_known_page *known_page;
 	struct list_head lru_list;
 	uintptr_t main_pg_cookie;
+	u64 xfer_cookie;
 	struct hlist_node node;
+	struct hlist_node addr_node; /* for addr_lookup ((mm, addr) -> slot) */
 	atomic_t transfer_in_progress; /* non-zero if alloc/refault/evict in flight */
 } remote_numa_cached_page_t;
 
@@ -52,6 +54,7 @@ typedef struct remote_numa_client_cache {
 	struct remote_numa_main_trprt_if *trprt;
 	DECLARE_HASHTABLE(page_lookup, REMOTE_NUMA_CLIENT_CACHE_HASH_BITS);
 	DECLARE_HASHTABLE(known_pages, REMOTE_NUMA_CLIENT_CACHE_HASH_BITS);
+	DECLARE_HASHTABLE(addr_lookup, REMOTE_NUMA_CLIENT_CACHE_HASH_BITS);
 	struct delayed_work eviction_completion_work;
 } remote_numa_client_cache_t;
 
