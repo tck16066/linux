@@ -16,21 +16,37 @@
 
 #include "memory.h"
 #include "transport.h"
+#include "rn_counters.h"
 
 #define REMOTE_NUMA_SUPPORTED_PROTO  remote_numa_protocol_0_1
 #define REMOTE_NUMA_XFER_HASH_BITS 12
 #define REMOTE_NUMA_REXMIT_CHECK_MS 10
 
 #define REMOTE_NUMA_TRANSFER_TIMEOUT_MS 1000
-#define REMOTE_NUMA_DEFAUKT_RETRY_INTERVAL_MS 5
-#define REMOTE_NUMA_DEFGAULT_RETRY_INTERVAL_NS (REMOTE_NUMA_DEFAUKT_RETRY_INTERVAL_MS * NSEC_PER_MSEC)
-#define REMOTE_NUMA_MAX_RETRY_COUNT 20
+static u32 retry_interval_ms = 5;
+module_param(retry_interval_ms, uint, 0644);
+MODULE_PARM_DESC(retry_interval_ms, "Base interval between retries in ms");
+static u32 max_retry_count = 20;
+module_param(max_retry_count, uint, 0644);
+MODULE_PARM_DESC(max_retry_count, "Max number of retries");
 
 DEFINE_HASHTABLE(xfer_table, REMOTE_NUMA_XFER_HASH_BITS);
 
 #include <linux/atomic.h>
-static spinlock_t hacky_spinlock;
-static int hack;
+#include <linux/rcupdate.h>
+/*
+ * xfer_table is an RCU-protected hash table. Readers walk it under
+ * rcu_read_lock() without taking a lock; only the rare insert/remove takes
+ * xfer_table_lock, briefly, to serialize the list mutation (hash_add_rcu /
+ * hash_del_rcu). Reclamation is deferred with call_rcu() so an in-flight
+ * reader can never touch a freed xfer. The "hack" tag counter is an atomic.
+ * Individual transfers' mutable state is protected by their own
+ * main_xfer_state_t::xfer_lock. Lock ordering (no inversions):
+ *     xfer_table_lock  (outer, brief, writers only)
+ *       -> xfer->xfer_lock  (inner)
+ */
+static spinlock_t xfer_table_lock;
+static atomic_t hack;
 
 
 typedef struct main_xfer_state {
@@ -59,6 +75,21 @@ typedef struct main_xfer_state {
 	unsigned long sent_bitmap[BITS_TO_LONGS(PAGE_SIZE)];
 
 	void *return_info;
+
+	/* RCU reclamation head; freed via call_rcu() after the last ref drops. */
+	struct rcu_head rcu;
+
+	/* Transient link used only while the retry worker collects candidates. */
+	struct list_head retry_link;
+
+	/*
+	 * Per-transfer lock. Protects this xfer's mutable state: the
+	 * received/sent bitmaps, retry_count/retry_deadline, and the hack tag.
+	 * The global xfer_table_lock (outer) serializes hash-table mutations
+	 * (hash_add_rcu / hash_del_rcu); whenever both are needed the table
+	 * lock is taken first, then the xfer lock.
+	 */
+	spinlock_t xfer_lock;
 } main_xfer_state_t;
 
 struct retry_work_item {
@@ -151,31 +182,23 @@ static u32 xfer_compute_max_contig(main_xfer_state_t *x)
 	return ret;
 }
 
-static int remote_numa_xfer_wait_complete(main_xfer_state_t *xfer, unsigned long timeout_jiffies)
-{
-	int ret = wait_event_timeout(
-		xfer->waitq,
-		xfer_compute_max_contig(xfer) >= PAGE_SIZE,
-		timeout_jiffies) > 0 ? 0 : -ETIMEDOUT;
-	return ret;
-}
-
 static inline u32 xfer_hash(u64 cookie)
 {
 	return hash_64(cookie, REMOTE_NUMA_XFER_HASH_BITS);
 }
 
-static void xfer_free(main_xfer_state_t *xfer)
+static void xfer_free_rcu(struct rcu_head *rcu)
 {
+	main_xfer_state_t *xfer = container_of(rcu, main_xfer_state_t, rcu);
 	struct remote_numa_cached_page *cached = xfer->cached_pg;
-	
+
 	// Free cached_pg if it was allocated for mem_free tracking
 	if (xfer->transfer_type == remote_numa_mem_free && cached)
 	{
 		kfree(cached->known_page);
 		kfree(cached);
 	}
-	
+
 	kfree(xfer);
 }
 
@@ -184,23 +207,31 @@ static void xfer_put(main_xfer_state_t *xfer)
 	if (!xfer)
 		return;
 	if (refcount_dec_and_test(&xfer->refcnt))
-		xfer_free(xfer);
+		call_rcu(&xfer->rcu, xfer_free_rcu);
 }
 
 static main_xfer_state_t *xfer_get(u64 cookie)
 {
 	main_xfer_state_t *xfer;
 
-	spin_lock(&hacky_spinlock);
-	hash_for_each_possible(xfer_table, xfer, node, xfer_hash(cookie)) {
+	/*
+	 * RCU read-side: walk the table lock-free. refcount_inc_not_zero() is
+	 * atomic and safe to call here; a concurrently-reclaimed xfer either
+	 * still has the table reference (so the inc succeeds and our own
+	 * reference keeps it alive) or is already freed (refcount 0 -> the inc
+	 * fails and we keep walking). call_rcu() guarantees a freed xfer stays
+	 * allocated for the duration of this RCU read section.
+	 */
+	rcu_read_lock();
+	hash_for_each_possible_rcu(xfer_table, xfer, node, xfer_hash(cookie)) {
 		if (((u64)cookie) != xfer->lookup_cookie)
 			continue;
 		if (!refcount_inc_not_zero(&xfer->refcnt))
 			continue;
-		spin_unlock(&hacky_spinlock);
+		rcu_read_unlock();
 		return xfer;
 	}
-	spin_unlock(&hacky_spinlock);
+	rcu_read_unlock();
 	return NULL;
 }
 
@@ -266,7 +297,7 @@ static int remote_numa_send_segment(main_xfer_state_t *xfer, u32 offset, u16 seg
 	alloc_tx_buffer(xfer, sizeof(*msg) + payload_len, &tx_buf, v);
 	if (!tx_buf || !msg)
 		return -ENOMEM;
-	spin_lock(&hacky_spinlock);
+	spin_lock(&xfer->xfer_lock);
 
 	msg->hdr.version = REMOTE_NUMA_SUPPORTED_PROTO;
 	msg->hdr.type = xfer->transfer_type;
@@ -278,12 +309,14 @@ static int remote_numa_send_segment(main_xfer_state_t *xfer, u32 offset, u16 seg
 	msg->sender_pg_cookie = xfer->cached_pg->main_pg_cookie;
 	msg->receiver_pg_cookie = xfer->cached_pg->known_page->donor_pg_cookie;
 	msg->hack = xfer->hack;
-	spin_unlock(&hacky_spinlock);
+	spin_unlock(&xfer->xfer_lock);
 
 	void *payload = ((u8 *)msg) + sizeof(*msg);
 	memcpy(payload, data + offset, payload_len);
 
+	spin_lock(&xfer->xfer_lock);
 	set_bit(offset / seg_len, xfer->sent_bitmap);
+	spin_unlock(&xfer->xfer_lock);
 
 	int ret = tx_msg(xfer, tx_buf);
 
@@ -294,69 +327,96 @@ static void remote_numa_retry_xfers(struct work_struct *work)
 {
 	if (hash_empty(xfer_table)) {
 		schedule_delayed_work(&remote_numa_retry_work,
-			msecs_to_jiffies(REMOTE_NUMA_DEFAUKT_RETRY_INTERVAL_MS));
+			msecs_to_jiffies(retry_interval_ms));
 		return;
 	}
 
 	u64 now_ns = ktime_get_ns();
 	main_xfer_state_t *xfer;
-	struct hlist_node *tmp;
+	main_xfer_state_t *tmp_xfer;
 	int bkt;
 	LIST_HEAD(work_list);
-	main_xfer_state_t **cleanup_array = NULL;
-	int cleanup_count = 0;
-	int cleanup_capacity = 16;
+	LIST_HEAD(candidates);
 
-	/* Use an array to store pointers to completed transfers to minimize lock hold time */
-	cleanup_array = kmalloc(cleanup_capacity * sizeof(*cleanup_array), GFP_KERNEL);
-	if (!cleanup_array) {
-		schedule_delayed_work(&remote_numa_retry_work,
-			msecs_to_jiffies(REMOTE_NUMA_DEFAUKT_RETRY_INTERVAL_MS));
-		return;
-	}
-
-	spin_lock(&hacky_spinlock);
-	hash_for_each_safe(xfer_table, bkt, tmp, xfer, node) {
+	/*
+	 * Phase 1: walk the table under RCU and grab a reference on every donor
+	 * xfer. Keep this section short - no bitmap scans, no allocation. The
+	 * reference keeps each xfer alive for the rest of this worker even if it
+	 * is concurrently removed from the table and freed.
+	 */
+	rcu_read_lock();
+	hash_for_each_rcu(xfer_table, bkt, xfer, node) {
 		if (xfer->is_main_node)
 			continue;
+		/*
+		 * Take a reference that keeps the xfer alive through phase 2.
+		 * inc_not_zero: if a concurrent completion already dropped the
+		 * last reference, the xfer is being reclaimed and we skip it.
+		 */
+		if (!refcount_inc_not_zero(&xfer->refcnt))
+			continue;
+		list_add(&xfer->retry_link, &candidates);
+	}
+	rcu_read_unlock();
 
-		if (xfer_compute_max_contig(xfer) >= PAGE_SIZE) {
-			hash_del(&xfer->node);
-			if (cleanup_count < cleanup_capacity)
-				cleanup_array[cleanup_count++] = xfer;
-			else /* Out of space in cleanup array, drop table ref now. */
+	/*
+	 * Phase 2: process the collected donor xfers. We hold a reference on
+	 * each, so they cannot be freed under us. The per-xfer lock guards the
+	 * mutable fields; the table lock is only taken briefly to remove a
+	 * finished or timed-out xfer.
+	 */
+	list_for_each_entry_safe(xfer, tmp_xfer, &candidates, retry_link) {
+		bool complete, timed_out, due;
+
+		spin_lock(&xfer->xfer_lock);
+		complete = xfer_compute_max_contig(xfer) >= PAGE_SIZE;
+		timed_out = xfer->retry_count >= max_retry_count;
+		due = ktime_to_ns(xfer->retry_deadline) < now_ns;
+		spin_unlock(&xfer->xfer_lock);
+
+		if (complete || timed_out) {
+			bool removed = false;
+
+			if (timed_out)
+				printk(KERN_WARNING "remote_numa: donor xfer timeout\n");
+			spin_lock(&xfer_table_lock);
+			if (!hlist_unhashed(&xfer->node)) {
+				hash_del_rcu(&xfer->node);
+				removed = true;
+			}
+			spin_unlock(&xfer_table_lock);
+			/* Drop our phase-1 ref; also the table ref if we removed it. */
+			xfer_put(xfer);
+			if (removed)
 				xfer_put(xfer);
 			continue;
 		}
 
-		if (ktime_to_ns(xfer->retry_deadline) >= now_ns)
-			continue;
-
-		if (xfer->retry_count >= REMOTE_NUMA_MAX_RETRY_COUNT) {
-			printk(KERN_WARNING "remote_numa: donor xfer timeout\n");
-			hash_del(&xfer->node);
-			if (cleanup_count < cleanup_capacity)
-				cleanup_array[cleanup_count++] = xfer;
-			else
-				xfer_put(xfer);
+		if (!due) {
+			/* Not due yet; drop our phase-1 reference. */
+			xfer_put(xfer);
 			continue;
 		}
 
 		struct retry_work_item *item = kmalloc(sizeof(*item), GFP_ATOMIC);
 		if (item) {
-			/* Hold a reference while item lives beyond the table lock. */
+			/* item lives beyond this iteration; take an extra ref. */
 			refcount_inc(&xfer->refcnt);
 			item->xfer = xfer;
 			item->seg_len = xfer_state_max_payload(xfer) - sizeof(remote_numa_mem_pg_xfer_t);
 			list_add(&item->list, &work_list);
 		}
 
+		spin_lock(&xfer->xfer_lock);
 		xfer->retry_count++;
-		u64 base_interval = REMOTE_NUMA_DEFGAULT_RETRY_INTERVAL_NS << xfer->retry_count;
+		u64 base_interval = ((u64)retry_interval_ms * NSEC_PER_MSEC) << xfer->retry_count;
 		u64 jitter_ns = get_random_u32() % (base_interval / 10);
 		xfer->retry_deadline = ktime_add_ns(ktime_get(), base_interval + jitter_ns);
+		spin_unlock(&xfer->xfer_lock);
+
+		/* Drop our phase-1 reference. */
+		xfer_put(xfer);
 	}
-	spin_unlock(&hacky_spinlock);
 
 	struct retry_work_item *item, *item_tmp;
 	list_for_each_entry_safe(item, item_tmp, &work_list, list) {
@@ -373,12 +433,8 @@ static void remote_numa_retry_xfers(struct work_struct *work)
 		kfree(item);
 	}
 
-	for (int i = 0; i < cleanup_count; i++)
-		xfer_put(cleanup_array[i]);
-	kfree(cleanup_array);
-
 	schedule_delayed_work(&remote_numa_retry_work,
-		msecs_to_jiffies(REMOTE_NUMA_DEFAUKT_RETRY_INTERVAL_MS));
+		msecs_to_jiffies(retry_interval_ms));
 }
 
 static void remote_numa_start_retry_worker(void)
@@ -395,12 +451,69 @@ static void remote_numa_stop_retry_worker(void)
 bool remote_numa_transport_is_transfer_complete(
 	struct remote_numa_cached_page *cached_target)
 {
-	main_xfer_state_t *xfer = xfer_get((uintptr_t)cached_target);
-	if (!xfer)
-		return atomic_read(&cached_target->transfer_in_progress) == 0;
-	bool done = xfer_compute_max_contig(xfer) >= PAGE_SIZE;
-	xfer_put(xfer);
-	return done;
+	atomic_inc(&rn_tc_call);
+	main_xfer_state_t *xfer = xfer_get(cached_target->xfer_cookie);
+	if (!xfer) {
+		bool r = atomic_read(&cached_target->transfer_in_progress) == 0;
+		atomic_inc(&rn_tc_no_xfer);
+		if (r)
+			atomic_inc(&rn_tc_no_xfer_done);
+		else
+			atomic_inc(&rn_tc_no_xfer_wip);
+		return r;
+	}
+	atomic_inc(&rn_tc_xfer_present);
+	{
+		unsigned long mc;
+		bool done;
+		bool stale;
+		spin_lock(&xfer->xfer_lock);
+		mc = xfer_compute_max_contig(xfer);
+		done = mc >= PAGE_SIZE;
+		stale = (xfer->cached_pg != cached_target);
+		spin_unlock(&xfer->xfer_lock);
+		if (done)
+			atomic_inc(&rn_tc_xfer_done);
+		else {
+			atomic_inc(&rn_tc_xfer_notdone);
+			atomic_long_set(&rn_tc_xfer_last_mc, (long)mc);
+		}
+		if (stale) {
+			atomic_inc(&rn_tc_stale);
+			if (done)
+				atomic_inc(&rn_tc_stale_done);
+			else
+				atomic_inc(&rn_tc_stale_notdone);
+		}
+		if (done) {
+			/*
+			 * Remove the completed main-side xfer from the table,
+			 * mirroring the alloc path
+			 * (remote_numa_check_transfer_complete). Otherwise the xfer
+			 * leaks and a reused entry address can make xfer_get()
+			 * return a stale completed xfer, causing a
+			 * premature-completion data corruption on a later transfer
+			 * of the same page.
+			 */
+			bool removed = false;
+			spin_lock(&xfer_table_lock);
+			if (!hlist_unhashed(&xfer->node)) {
+				hash_del_rcu(&xfer->node);
+				removed = true;
+			}
+			spin_unlock(&xfer_table_lock);
+			if (removed) {
+				atomic_inc(&rn_tc_removed);
+				if (xfer->cached_pg->xfer_cookie == xfer->lookup_cookie)
+					xfer->cached_pg->xfer_cookie = 0;
+				xfer_put(xfer); /* drop the table's reference */
+			} else {
+				atomic_inc(&rn_tc_removed_skip);
+			}
+		}
+		xfer_put(xfer); /* drop our lookup reference */
+		return done;
+	}
 }
 
 /* Pure lookup: caller must hold rcu_read_lock() */
@@ -443,6 +556,8 @@ static int remote_numa_rx_mem_pg_refetch(
 	remote_numa_mem_refetch_t *refetch,
 	u32 main_node_id)
 {
+	atomic_inc(&rn_dnh_enter);
+
 	struct remote_numa_mem_mgr *mgr = donor_if->trprt_ctx->mem;
 	if (!mgr)
 		return -EIO;
@@ -453,6 +568,7 @@ static int remote_numa_rx_mem_pg_refetch(
 	if (remote_numa_mem_lookup_page(mgr, refetch->donor_pg_cookie,
 	                                 &page_ptr, &rn_pg) != 0)
 	{
+		atomic_inc(&rn_dnh_noent);
 		return -ENOENT;
 	}
 	cached_pg = &rn_pg->cached_pg;
@@ -462,6 +578,11 @@ static int remote_numa_rx_mem_pg_refetch(
 	{
 		return -EIO;
 	}
+
+	/* Track whether the donor is sending a zeroed page (corruption indicator). */
+	atomic_inc(&rn_dnh_send);
+	if (((u8 *)page_ptr)[0] == 0)
+		atomic_inc(&rn_dnh_first_zero);
 
 	remote_numa_node_t *main_node = __remote_numa_get_node_locking(
 		donor_if->trprt_ctx->node_table,
@@ -476,6 +597,7 @@ static int remote_numa_rx_mem_pg_refetch(
 	if (!xfer)
 		return -ENOMEM;
 	refcount_set(&xfer->refcnt, 1);
+	spin_lock_init(&xfer->xfer_lock);
 
 	// TODO, this is super confusing, need to rename some fields.
 	// These donor/main pg cookies need to be backwards since
@@ -489,8 +611,12 @@ static int remote_numa_rx_mem_pg_refetch(
 	cached_pg->known_page->mm = NULL;
 	cached_pg->known_page->addr = 0;
 
-	spin_lock(&hacky_spinlock);
-	xfer->hack		= ++hack;
+	/*
+	 * The xfer is private (not yet in xfer_table), so initialize its fields
+	 * without a lock. Only the global hack counter and the table insertion
+	 * require the table lock. The wmb + table lock publish the fully
+	 * initialized xfer to concurrent xfer_get() lookups.
+	 */
 	xfer->cached_pg		= cached_pg;
 	xfer->lookup_cookie	= refetch->donor_pg_cookie;
 	xfer->hdr_main_cookie	= cached_pg->known_page->donor_id;
@@ -504,14 +630,17 @@ static int remote_numa_rx_mem_pg_refetch(
 	init_waitqueue_head(&xfer->waitq);
 	bitmap_zero(xfer->sent_bitmap, PAGE_SIZE);
 	bitmap_zero(xfer->received_bitmap, PAGE_SIZE);
-	u64 jitter_ns = get_random_u32() % (REMOTE_NUMA_DEFGAULT_RETRY_INTERVAL_NS / 10);
+	u64 jitter_ns = get_random_u32() % (((u64)retry_interval_ms * NSEC_PER_MSEC) / 10);
 	xfer->retry_deadline	= ktime_add_ns(ktime_get(),
-					   REMOTE_NUMA_DEFGAULT_RETRY_INTERVAL_NS + jitter_ns);
+					   ((u64)retry_interval_ms * NSEC_PER_MSEC) + jitter_ns);
 	xfer->retry_count	= 0;
 	smp_wmb();
-	hash_add(xfer_table, &xfer->node,
+
+	xfer->hack		= atomic_inc_return(&hack);
+	spin_lock(&xfer_table_lock);
+	hash_add_rcu(xfer_table, &xfer->node,
 		 xfer_hash(refetch->donor_pg_cookie));
-	spin_unlock(&hacky_spinlock);
+	spin_unlock(&xfer_table_lock);
 
 	u16 seg_len = donor_if->get_max_payload_len() -
 		      sizeof(remote_numa_mem_pg_xfer_t);
@@ -538,10 +667,15 @@ int remote_numa_transport_alloc_page_async(
 		return -ENOMEM;
 	}
 	refcount_set(&xfer->refcnt, 1);
+	spin_lock_init(&xfer->xfer_lock);
+
+	xfer->hack = atomic_inc_return(&hack);
+	xfer_hack = xfer->hack;
 
 	/* Prepare xfer state before publishing it in xfer_table. */
 	xfer->cached_pg = cached_target;
-	xfer->lookup_cookie = main_pg_cookie;
+	xfer->lookup_cookie = xfer->hack;
+	cached_target->xfer_cookie = xfer->hack;
 	xfer->cached_pg->known_page->donor_pg_cookie = 0;
 	xfer->cached_pg->main_pg_cookie = main_pg_cookie;
 	/* Keep a copy on the known_page so future frees can always recover it. */
@@ -559,28 +693,28 @@ int remote_numa_transport_alloc_page_async(
 	bitmap_zero(xfer->received_bitmap, PAGE_SIZE);
 	bitmap_zero(xfer->sent_bitmap, PAGE_SIZE);
 	{
-		u64 jitter_ns = get_random_u32() % (REMOTE_NUMA_DEFGAULT_RETRY_INTERVAL_NS / 10);
+		u64 jitter_ns = get_random_u32() % (((u64)retry_interval_ms * NSEC_PER_MSEC) / 10);
 		xfer->retry_deadline = ktime_add_ns(ktime_get(),
-					  REMOTE_NUMA_DEFGAULT_RETRY_INTERVAL_NS + jitter_ns);
+					  ((u64)retry_interval_ms * NSEC_PER_MSEC) + jitter_ns);
 	}
 	xfer->retry_count = 0;
 
 	/*
-	 * Keep hacky_spinlock held only while touching global xfer_table / hack.
-	 * Do not hold a spinlock across alloc_tx_buffer() or tx_msg().
+	 * The xfer is private here (fields set above); only the table insertion
+	 * needs the table lock. Do not hold a spinlock across
+	 * alloc_tx_buffer() or tx_msg().
 	 */
-	spin_lock(&hacky_spinlock);
-	xfer->hack = ++hack;
-	xfer_hack = xfer->hack;
-	hash_add(xfer_table, &xfer->node, xfer_hash(main_pg_cookie));
-	spin_unlock(&hacky_spinlock);
+	spin_lock(&xfer_table_lock);
+	hash_add_rcu(xfer_table, &xfer->node, xfer_hash(xfer->hack));
+	spin_unlock(&xfer_table_lock);
 
 	smp_wmb();
 	trprt->alloc_tx_buffer(sizeof(*req), &tx_buf, v);
 	if (!tx_buf || !req) {
-		spin_lock(&hacky_spinlock);
-		hash_del(&xfer->node);
-		spin_unlock(&hacky_spinlock);
+		cached_target->xfer_cookie = 0;
+		spin_lock(&xfer_table_lock);
+		hash_del_rcu(&xfer->node);
+		spin_unlock(&xfer_table_lock);
 		xfer_put(xfer);
 		return -ENOMEM;
 	}
@@ -589,13 +723,14 @@ int remote_numa_transport_alloc_page_async(
 	req->hdr.type = remote_numa_mem_alloc;
 	req->hdr.main_cookie = donor->node_id;
 	req->hdr.donor_cookie = donor->donor_cookie;
-	req->main_pg_cookie = main_pg_cookie;
+	req->main_pg_cookie = xfer->hack;
 	req->hack = xfer_hack;
 
 	if (trprt->tx_msg(trprt->trprt_ctx, donor->priv_return_info, tx_buf)) {
-		spin_lock(&hacky_spinlock);
-		hash_del(&xfer->node);
-		spin_unlock(&hacky_spinlock);
+		cached_target->xfer_cookie = 0;
+		spin_lock(&xfer_table_lock);
+		hash_del_rcu(&xfer->node);
+		spin_unlock(&xfer_table_lock);
 		xfer_put(xfer);
 		return -EIO;
 	}
@@ -610,6 +745,8 @@ int remote_numa_transport_refetch_page_async(
 	u64 donor_pg_cookie,
 	struct remote_numa_cached_page *cached_target)
 {
+	atomic_inc(&rn_mrs_send);
+
 	remote_numa_node_t *donor = NULL;
 
 	rcu_read_lock();
@@ -629,6 +766,7 @@ int remote_numa_transport_refetch_page_async(
 	if (!xfer)
 		return -ENOMEM;
 	refcount_set(&xfer->refcnt, 1);
+	spin_lock_init(&xfer->xfer_lock);
 
 	xfer->cached_pg = cached_target;
 	xfer->cached_pg->known_page->donor_pg_cookie = donor_pg_cookie;
@@ -640,29 +778,32 @@ int remote_numa_transport_refetch_page_async(
 	xfer->last_update = ktime_get();
 	xfer->cached_pg->main_pg_cookie = (uintptr_t)cached_target;
 	xfer->cached_pg->known_page->main_pg_cookie = xfer->cached_pg->main_pg_cookie;
-	xfer->lookup_cookie = (uintptr_t)cached_target;
+	xfer->hack = atomic_inc_return(&hack);
+	xfer->lookup_cookie = xfer->hack;
+	cached_target->xfer_cookie = xfer->hack;
 	xfer->main_trprt = trprt;
 	xfer->is_main_node = true;
 	xfer->return_info = donor->priv_return_info;
 	init_waitqueue_head(&xfer->waitq);
 	bitmap_zero(xfer->sent_bitmap, PAGE_SIZE);
 	bitmap_zero(xfer->received_bitmap, PAGE_SIZE);
-	xfer->retry_deadline = ktime_add_ns(ktime_get(), REMOTE_NUMA_DEFGAULT_RETRY_INTERVAL_NS);
+	xfer->retry_deadline = ktime_add_ns(ktime_get(), ((u64)retry_interval_ms * NSEC_PER_MSEC));
 	xfer->retry_count = 0;
 
 	smp_wmb();
-	spin_lock(&hacky_spinlock);
-	hash_add(xfer_table, &xfer->node, xfer_hash((uintptr_t)cached_target));
-	spin_unlock(&hacky_spinlock);
+	spin_lock(&xfer_table_lock);
+	hash_add_rcu(xfer_table, &xfer->node, xfer_hash(xfer->hack));
+	spin_unlock(&xfer_table_lock);
 
 	void *tx_buf;
 	remote_numa_mem_refetch_t *refetch;
 	void **v = (void **)&refetch;
 	trprt->alloc_tx_buffer(sizeof(*refetch), &tx_buf, v);
 	if (!tx_buf || !refetch) {
-		spin_lock(&hacky_spinlock);
-		hash_del(&xfer->node);
-		spin_unlock(&hacky_spinlock);
+		cached_target->xfer_cookie = 0;
+		spin_lock(&xfer_table_lock);
+		hash_del_rcu(&xfer->node);
+		spin_unlock(&xfer_table_lock);
 		xfer_put(xfer);
 		return -ENOMEM;
 	}
@@ -672,12 +813,13 @@ int remote_numa_transport_refetch_page_async(
 	refetch->hdr.main_cookie   = donor->node_id;
 	refetch->hdr.donor_cookie  = donor->donor_cookie;
 	refetch->donor_pg_cookie   = donor_pg_cookie;
-	refetch->main_pg_cookie    = cached_target->main_pg_cookie;
+	refetch->main_pg_cookie    = xfer->hack;
 
 	if (trprt->tx_msg(trprt->trprt_ctx, donor->priv_return_info, tx_buf)) {
-		spin_lock(&hacky_spinlock);
-		hash_del(&xfer->node);
-		spin_unlock(&hacky_spinlock);
+		cached_target->xfer_cookie = 0;
+		spin_lock(&xfer_table_lock);
+		hash_del_rcu(&xfer->node);
+		spin_unlock(&xfer_table_lock);
 		xfer_put(xfer);
 		return -EIO;
 	}
@@ -719,8 +861,7 @@ static int remote_numa_rx_mem_pg_sync_xfer_from(
 		void *payload = ((u8 *)xfer) + sizeof(*xfer);
 		memcpy(dst + xfer->seq_num, payload, xfer->payload_len);
 	} else {
-		pr_debug("remote_numa: mem_sync for unknown/idle cookie=%llu ret=%d\n",
-			 xfer->receiver_pg_cookie, lookup_ret);
+		atomic_inc(&rn_sync_skip);
 	}
 
 	void *ack_buf;
@@ -769,21 +910,21 @@ int remote_numa_rx_mem_pg_sat_ack(
 	 *   main side has already timed out or retired the xfer.
 	 */
 	if (!xfer) {
+		atomic_inc(&rn_ack_drop_nf);
 		return 0;
 	}
 	if (ack->hack != xfer->hack) {
-		pr_debug("remote_numa: sat_ack hack mismatch main_cookie=%llu xfer_hack=%d ack_hack=%d\n",
-			 ack->main_pg_cookie, xfer->hack, ack->hack);
+		atomic_inc(&rn_ack_drop_hack);
 		xfer_put(xfer);
 		return 0;
 	}
 
 	/* mark done and publish donor cookie */
-	spin_lock(&hacky_spinlock);
+	spin_lock(&xfer->xfer_lock);
 	bitmap_fill(xfer->received_bitmap, PAGE_SIZE);
 	xfer->cached_pg->known_page->donor_pg_cookie = ack->donor_pg_cookie;
 	smp_wmb();
-	spin_unlock(&hacky_spinlock);
+	spin_unlock(&xfer->xfer_lock);
 	wake_up(&xfer->waitq);
 	xfer_put(xfer);
 	return 0;
@@ -798,10 +939,14 @@ int remote_numa_rx_mem_pg_sync_ack(
 	if (!xfer)
 		return -ENOENT;
 
+	bool done;
+	spin_lock(&xfer->xfer_lock);
 	bitmap_set(xfer->received_bitmap, ack->bottom_seq_num,
-		ack->top_seq_num - ack->bottom_seq_num);
+		   (ack->top_seq_num - ack->bottom_seq_num));
+	done = xfer_compute_max_contig(xfer) >= PAGE_SIZE;
+	spin_unlock(&xfer->xfer_lock);
 
-	if (xfer_compute_max_contig(xfer) >= PAGE_SIZE)
+	if (done)
 	{
 		wake_up(&xfer->waitq);
 	}
@@ -828,11 +973,12 @@ int remote_numa_tx_mem_pg_sync_xfer_async(
 	if (!xfer)
 		return -ENOMEM;
 	refcount_set(&xfer->refcnt, 1);
+	spin_lock_init(&xfer->xfer_lock);
 
-	spin_lock(&hacky_spinlock);
-	xfer->hack = ++hack;
+	/* The xfer is private (not yet in xfer_table); init fields unlocked. */
 	xfer->cached_pg = victim;
 	xfer->lookup_cookie = (uintptr_t)victim;
+	victim->xfer_cookie = (uintptr_t)victim;
 	xfer->hdr_main_cookie = victim->known_page->donor_id;
 	xfer->hdr_donor_cookie = victim->known_page->donor_cookie;
 	xfer->target = pg;
@@ -844,15 +990,17 @@ int remote_numa_tx_mem_pg_sync_xfer_async(
 	init_waitqueue_head(&xfer->waitq);
 	bitmap_zero(xfer->sent_bitmap, PAGE_SIZE);
 	bitmap_zero(xfer->received_bitmap, PAGE_SIZE);
-	xfer->retry_deadline = ktime_add_ns(ktime_get(), REMOTE_NUMA_DEFGAULT_RETRY_INTERVAL_NS);
+	xfer->retry_deadline = ktime_add_ns(ktime_get(), ((u64)retry_interval_ms * NSEC_PER_MSEC));
 	xfer->retry_count = 0;
 
-	smp_wmb();
-	hash_add(xfer_table, &xfer->node, xfer_hash((uintptr_t)victim));
-
 	u16 seg_len = main_if->get_max_payload_len() - sizeof(remote_numa_mem_pg_xfer_t);
+
 	smp_wmb();
-	spin_unlock(&hacky_spinlock);
+
+	xfer->hack = atomic_inc_return(&hack);
+	spin_lock(&xfer_table_lock);
+	hash_add_rcu(xfer_table, &xfer->node, xfer_hash((uintptr_t)victim));
+	spin_unlock(&xfer_table_lock);
 
 	remote_numa_send_all_segments(xfer, seg_len);
 
@@ -863,22 +1011,29 @@ int remote_numa_tx_mem_pg_sync_xfer_async(
 /* Check if transfer is complete. Returns 0 if done, -EAGAIN if in progress, <0 on error */
 int remote_numa_check_transfer_complete(struct remote_numa_cached_page *cached_pg)
 {
-	main_xfer_state_t *xfer = xfer_get((uintptr_t)cached_pg);
+	main_xfer_state_t *xfer = xfer_get(cached_pg->xfer_cookie);
 	if (!xfer) {
 		/* Missing xfer state while caller still tracks a page: treat as error */
 		return -ENOENT;
 	}
 
 	/* Check if transfer is complete */
-	if (xfer_compute_max_contig(xfer) >= PAGE_SIZE) {
+	bool done;
+	spin_lock(&xfer->xfer_lock);
+	done = xfer_compute_max_contig(xfer) >= PAGE_SIZE;
+	spin_unlock(&xfer->xfer_lock);
+
+	if (done) {
 		/* Transfer complete - clean up */
 		bool removed = false;
-		spin_lock(&hacky_spinlock);
+		spin_lock(&xfer_table_lock);
 		if (!hlist_unhashed(&xfer->node)) {
-			hash_del(&xfer->node);
+			hash_del_rcu(&xfer->node);
 			removed = true;
 		}
-		spin_unlock(&hacky_spinlock);
+		spin_unlock(&xfer_table_lock);
+		if (removed && xfer->cached_pg->xfer_cookie == xfer->lookup_cookie)
+			xfer->cached_pg->xfer_cookie = 0;
 		/* Drop the table's reference (if we removed it). */
 		if (removed)
 			xfer_put(xfer);
@@ -1139,6 +1294,8 @@ int remote_numa_rx_mem_resp(
 	node->donor_cookie = resp->hdr.donor_cookie;
 	spin_unlock(&node->node_lock);
 
+	printk(KERN_INFO "remote_numa: mem_resp from node=%u free_pages=%u page_size_rank=%u (valid_mem_resp now set)\n",
+	       node->node_id, resp->free_pages, resp->page_size_rank);
 	return 0;
 }
 
@@ -1164,7 +1321,7 @@ static int remote_numa_rx_mem_alloc_from(
     }
 
     if (remote_numa_mem_alloc_page(mgr, &cookie, &page) != 0) {
-        printk(KERN_DEBUG "Bad page alloc manager in donor.\n");
+        atomic_inc(&rn_dmf_fail);
 		return -ENOMEM;
     }
 
@@ -1264,18 +1421,12 @@ int remote_numa_rx_mem_pg_free_ack(
 	remote_numa_mem_free_ack_t *ack)
 {
 	/*
-	 * Current main-side free path is fire-and-forget; we don't track an xfer
-	 * for mem_free, so there may be no matching state here. Treat the ACK as
-	 * advisory only and ignore it if we have nothing to wake.
+	 * The main-side free path is fire-and-forget; no xfer is tracked for
+	 * mem_free. The ack's main_pg_cookie identifies the entry as it was at
+	 * free time, which may since have been reused for a different page's
+	 * in-flight xfer, so it must never be used to complete an unrelated
+	 * transfer. Ignore the ack.
 	 */
-	main_xfer_state_t *xfer = xfer_get(ack->main_pg_cookie);
-	if (!xfer)
-		return 0;
-
-	bitmap_fill(xfer->received_bitmap, PAGE_SIZE);
-	wake_up(&xfer->waitq);
-	xfer_put(xfer);
-
 	return 0;
 }
 
@@ -1326,7 +1477,7 @@ int remote_numa_rx_mem_pg_refetch_sat(
 	main_xfer_state_t *xfer = xfer_get(sat->receiver_pg_cookie);
     if (!xfer)
     {
-	return -ENOENT;
+	return 0;
     }
     if (sat->payload_len + sat->seq_num > PAGE_SIZE)
 	{
@@ -1338,8 +1489,17 @@ int remote_numa_rx_mem_pg_refetch_sat(
     void *dst = page_address(xfer->target);
     memcpy(dst + sat->seq_num, ((u8 *)sat) + sizeof(*sat), sat->payload_len);
 
+    /* Track whether the main node received a zeroed page (corruption indicator). */
+    if (sat->seq_num == 0) {
+        atomic_inc(&rn_mrw_write);
+        if (((u8 *)dst)[0] == 0)
+            atomic_inc(&rn_mrw_first_zero);
+    }
+
     /* mark locally received so waiters can complete */
-    bitmap_set(xfer->received_bitmap, sat->seq_num, sat->payload_len);
+	spin_lock(&xfer->xfer_lock);
+	bitmap_set(xfer->received_bitmap, sat->seq_num, sat->payload_len);
+	spin_unlock(&xfer->xfer_lock);
 
     /* build ACK with bottom/top = [seq, seq+len), like sync */
     void *ack_buf;
@@ -1379,7 +1539,12 @@ int remote_numa_rx_mem_pg_refetch_sat(
     }
 
     /* done? wake any waiters */
-    if (xfer_compute_max_contig(xfer) >= PAGE_SIZE) {
+    bool done;
+    spin_lock(&xfer->xfer_lock);
+    done = xfer_compute_max_contig(xfer) >= PAGE_SIZE;
+    spin_unlock(&xfer->xfer_lock);
+
+    if (done) {
 	        wake_up(&xfer->waitq);
 	        xfer_put(xfer);
 	} else {
@@ -1394,8 +1559,13 @@ remote_numa_rx_mem_pg_refetch_ack(struct remote_numa_donor_trprt_if *donor_if,
                                   remote_numa_mem_pg_xfer_ack_t *ack)
 {
 	main_xfer_state_t *xfer = xfer_get(ack->receiver_pg_cookie);
+    /*
+     * Best-effort ack handling: if the xfer is already gone (timed out or
+     * retired), drop the ACK silently. This avoids spurious ENOENT errors
+     * when the main side has already cleaned up the xfer.
+     */
     if (!xfer)
-		return -ENOENT;
+		return 0;
 
     /* Stale in-flight? Keep behavior consistent with sync_ack: log and continue. */
     if (ack->hack != xfer->hack) {
@@ -1406,12 +1576,16 @@ remote_numa_rx_mem_pg_refetch_ack(struct remote_numa_donor_trprt_if *donor_if,
     }
 
     /* Range-based ACK: handle out-of-order arrivals without over-marking. */
-    bitmap_set(xfer->received_bitmap,
-               ack->bottom_seq_num,
-               ack->top_seq_num - ack->bottom_seq_num);
+    bool done;
+    spin_lock(&xfer->xfer_lock);
+	bitmap_set(xfer->received_bitmap,
+		   ack->bottom_seq_num,
+		   (ack->top_seq_num - ack->bottom_seq_num));
+    done = xfer_compute_max_contig(xfer) >= PAGE_SIZE;
+    spin_unlock(&xfer->xfer_lock);
 
     /* If the page is fully covered, wake the waiter. */
-    if (xfer_compute_max_contig(xfer) >= PAGE_SIZE) {
+    if (done) {
 	        wake_up(&xfer->waitq);
 	        xfer_put(xfer);
 	} else {
@@ -1423,8 +1597,8 @@ remote_numa_rx_mem_pg_refetch_ack(struct remote_numa_donor_trprt_if *donor_if,
 
 void tmp_init(void)
 {
-	spin_lock_init(&hacky_spinlock);
-	hack = 0;
+	spin_lock_init(&xfer_table_lock);
+	atomic_set(&hack, 0);
 }
 EXPORT_SYMBOL_GPL(tmp_init);
 

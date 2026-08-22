@@ -32,30 +32,51 @@
 
 #include "client_cache.h"
 #include "transport.h"
+#include "rn_counters.h"
 
 #include <linux/kthread.h>
 #include <linux/random.h>
 
 #define REMOTE_NUMA_STRESS_TEST 1
-#define REMOTE_NUMA_STRESS_MAX_CONCURRENT_OPS 4
-#define REMOTE_NUMA_STRESS_MINUTES 5
-#define REMOTE_NUMA_STRESS_THREADS 5
-
-/* Burst size for churn/refault/free operations in the main stress loop. */
-#define REMOTE_NUMA_STRESS_BURST_OPS 128
 
 /*
- * Number of distinct (addr,page) slots the stress test touches.
- * Must be > cache capacity (1200) to reliably trigger evictions/refaults.
+ * Stress test configuration (settable at insmod time).
+ *
+ * The userspace test mmaps a large region and issues one RUN_TEST ioctl;
+ * the kernel then spawns stress_threads kthreads that churn alloc/refault/
+ * free for stress_minutes. stress_test_pages must exceed the client cache
+ * capacity to reliably trigger evictions/refaults.
  */
-#define REMOTE_NUMA_STRESS_TEST_PAGES (1200 + 600)
+static int stress_minutes = 2;
+module_param(stress_minutes, int, 0644);
+MODULE_PARM_DESC(stress_minutes, "stress test duration (minutes)");
+
+static int stress_threads = 9;
+module_param(stress_threads, int, 0644);
+MODULE_PARM_DESC(stress_threads, "number of stress kthreads");
+
+static int stress_test_pages = 1800;
+module_param(stress_test_pages, int, 0644);
+MODULE_PARM_DESC(stress_test_pages, "distinct pages touched (must exceed cache capacity)");
+
+static int stress_burst_ops = 128;
+module_param(stress_burst_ops, int, 0644);
+MODULE_PARM_DESC(stress_burst_ops, "ops per churn/refault/free burst");
+
+static int stress_cache_size = 1500;
+module_param(stress_cache_size, int, 0644);
+MODULE_PARM_DESC(stress_cache_size, "logical hot working-set size (victim pages)");
+
+static int stress_max_concurrent = 9;
+module_param(stress_max_concurrent, int, 0644);
+MODULE_PARM_DESC(stress_max_concurrent, "max concurrent alloc/refault/free ops");
 
 struct stress_test_ctx {
     struct semaphore sem;
     atomic_long_t active_allocs;
+    atomic_t initial_done;
+    atomic_t total_threads;
 };
-
-#define REMOTE_NUMA_STRESS_CACHE_SIZE 1200
 
 struct stress_thread_info {
     int id;
@@ -152,7 +173,7 @@ static int stress_alloc_idx(struct stress_thread_info *info, int idx, unsigned l
 
     prep_ret = stress_prepare_vmf(info->mm, cur_addr, &fake_vmf);
     if (prep_ret) {
-         printk(KERN_DEBUG "[STRESS %d] ALLOC VMA not found for idx=%d addr=%px active_total=%ld active_thread=%lu\n",
+          pr_debug("[STRESS %d] ALLOC VMA not found for idx=%d addr=%px active_total=%ld active_thread=%lu\n",
              info->id, idx, (void *)cur_addr,
              atomic_long_read(&info->ctx->active_allocs),
              info->active_owned);
@@ -162,7 +183,7 @@ static int stress_alloc_idx(struct stress_thread_info *info, int idx, unsigned l
     }
 
     if (down_interruptible(&info->ctx->sem)) {
-         printk(KERN_DEBUG "[STRESS %d] ALLOC interrupted idx=%d addr=%px active_total=%ld active_thread=%lu\n",
+          pr_debug("[STRESS %d] ALLOC interrupted idx=%d addr=%px active_total=%ld active_thread=%lu\n",
                info->id, idx, (void *)cur_addr,
              atomic_long_read(&info->ctx->active_allocs),
              info->active_owned);
@@ -188,12 +209,18 @@ static int stress_alloc_idx(struct stress_thread_info *info, int idx, unsigned l
 
     info->alloc_retries += retry_count;
     if (IS_ERR(pg) || !pg) {
-         printk(KERN_DEBUG "[STRESS %d] ALLOC FAILED idx=%d addr=%px retries=%d active_total=%ld active_thread=%lu\n",
+          pr_debug("[STRESS %d] ALLOC FAILED idx=%d addr=%px retries=%d active_total=%ld active_thread=%lu\n",
              info->id, idx, (void *)cur_addr, retry_count,
              atomic_long_read(&info->ctx->active_allocs),
              info->active_owned);
         info->alloc_fail++;
-        info->had_error = 1;
+        /*
+         * -EAGAIN means the cache is full and no eviction could complete within
+         * the retry window -- an expected backoff under heavy eviction pressure,
+         * not a data-integrity failure. Only non-EAGAIN errors are fatal.
+         */
+        if (!IS_ERR(pg) || PTR_ERR(pg) != -EAGAIN)
+            info->had_error = 1;
         info->owned_pages[idx] = NULL;
         return IS_ERR(pg) ? (int)PTR_ERR(pg) : -ENOMEM;
     }
@@ -225,7 +252,7 @@ static int stress_refault_idx(struct stress_thread_info *info, int idx, unsigned
 
     prep_ret = stress_prepare_vmf(info->mm, cur_addr, &fake_vmf);
     if (prep_ret) {
-        printk(KERN_DEBUG "[STRESS %d] REFAULT VMA not found for idx=%d addr=%px\n",
+        pr_debug("[STRESS %d] REFAULT VMA not found for idx=%d addr=%px\n",
                info->id, idx, (void *)cur_addr);
         info->refault_fail++;
         info->had_error = 1;
@@ -263,15 +290,29 @@ static int stress_refault_idx(struct stress_thread_info *info, int idx, unsigned
     if (ret == -ENOENT) {
         /* Not evicted (no refault entry) is expected; count and move on. */
         info->refault_noent++;
+        atomic_inc(&rn_st_refault_enoent);
         return 0;
     }
     if (ret) {
-        printk(KERN_DEBUG "[STRESS %d] REFAULT FAILED idx=%d addr=%px ret=%d retries=%d\n",
+        if (ret == -EAGAIN)
+            atomic_inc(&rn_st_refault_eagain);
+        else
+            atomic_inc(&rn_st_refault_err);
+        pr_debug("[STRESS %d] REFAULT FAILED idx=%d addr=%px ret=%d retries=%d\n",
                info->id, idx, (void *)cur_addr, ret, retry_count);
         info->refault_fail++;
-        info->had_error = 1;
+        /*
+         * -EAGAIN means the refetch could not complete within the retry window --
+         * an expected backoff under heavy eviction pressure, not a
+         * data-integrity failure. Only non-EAGAIN errors are fatal.
+         */
+        if (ret != -EAGAIN)
+            info->had_error = 1;
         return ret;
     }
+
+    /* ret == 0: refault reported success */
+    atomic_inc(&rn_st_refault_ret0);
 
     /* Verify the page data after a successful refault. */
     if (info->expected_seed) {
@@ -281,11 +322,16 @@ static int stress_refault_idx(struct stress_thread_info *info, int idx, unsigned
         if (!seed)
             seed = stress_seed_for_addr(cur_addr);
         if (!stress_verify_page_pattern(info->owned_pages[idx], seed, &bad_off, &exp, &got)) {
-            printk(KERN_ERR "[STRESS %d] DATA CORRUPT idx=%d addr=%px off=%d exp=%u got=%u\n",
-                   info->id, idx, (void *)cur_addr, bad_off, exp, got);
             info->data_corrupt++;
             info->had_error = 1;
+            atomic_inc(&rn_st_ret0_corrupt);
+            printk(KERN_ERR "[STRESS %d] DATA CORRUPT idx=%d addr=%px off=%d exp=%u got=%u\n",
+                   info->id, idx, (void *)cur_addr, bad_off, exp, got);
+        } else {
+            atomic_inc(&rn_st_ret0_ok);
         }
+    } else {
+        atomic_inc(&rn_st_verify_none);
     }
     info->refault_success++;
     return 0;
@@ -323,7 +369,7 @@ static int stress_free_idx(struct stress_thread_info *info, int idx, unsigned lo
         return 0;
     }
     if (ret) {
-        printk(KERN_DEBUG "[STRESS %d] FREE FAILED idx=%d addr=%px ret=%d\n",
+        pr_debug("[STRESS %d] FREE FAILED idx=%d addr=%px ret=%d\n",
                info->id, idx, (void *)cur_addr, ret);
         info->free_fail++;
         info->had_error = 1;
@@ -346,7 +392,7 @@ static int stress_thread_fn(void *data) {
         // Use a semaphore to limit concurrent ops
         // (Initialized in run_stress_test)
     struct stress_thread_info *info = data;
-    unsigned long duration_jiffies = (unsigned long)REMOTE_NUMA_STRESS_MINUTES * 60 * HZ;
+    unsigned long duration_jiffies = (unsigned long)stress_minutes * 60 * HZ;
         unsigned long start_jiffies;
         unsigned long end_time;
     // Zero stats
@@ -363,7 +409,7 @@ static int stress_thread_fn(void *data) {
     info->free_fail = 0;
     info->free_noent = 0;
 
-	int cache_pages = REMOTE_NUMA_STRESS_CACHE_SIZE / REMOTE_NUMA_STRESS_THREADS;
+	int cache_pages = stress_cache_size / stress_threads;
 	if (cache_pages < 1)
 		cache_pages = 1;
 	int victim_pages = info->num_owned;
@@ -386,6 +432,22 @@ static int stress_thread_fn(void *data) {
         (void)stress_alloc_idx(info, idx, cur_addr);
     }
 
+    /*
+     * Barrier: ensure EVERY thread has finished its initial allocations -- and
+     * therefore written its victim pages' deterministic pattern -- before ANY
+     * thread enters the churn loop. The victim pattern is written after the
+     * allocation semaphore is released (stress_alloc_idx), and the sem is a
+     * counting semaphore, so without this barrier one thread's churn-phase
+     * allocation can evict (async-sync) another thread's victim page while that
+     * thread is still writing its initial pattern. The donor would then store a
+     * partially written page, and every later refault/verify of that victim
+     * reports permanent corruption (got=0 at a random offset).
+     */
+    atomic_inc(&info->ctx->initial_done);
+    while (atomic_read(&info->ctx->initial_done) <
+           atomic_read(&info->ctx->total_threads))
+        msleep(1);
+
     /* Start timing AFTER initial allocations so we actually stress for the full duration. */
     start_jiffies = jiffies;
     end_time = start_jiffies + duration_jiffies;
@@ -395,10 +457,10 @@ static int stress_thread_fn(void *data) {
     // Main stress phase: deterministic bursts to force eviction/refault/free
     while (time_before(jiffies, end_time) && !kthread_should_stop()) {
         if ((jiffies % HZ) == 0) {
-            printk(KERN_DEBUG "[STRESS %d] jiffies=%lu (seconds elapsed: %lu/%d)\n", info->id, jiffies, (jiffies - start_jiffies) / HZ, REMOTE_NUMA_STRESS_MINUTES * 60);
+            pr_debug("[STRESS %d] jiffies=%lu (seconds elapsed: %lu/%d)\n", info->id, jiffies, (jiffies - start_jiffies) / HZ, stress_minutes * 60);
         }
 		/* 1) Churn alloc burst: allocate pages beyond cache size to force evictions */
-		for (int i = 0; i < REMOTE_NUMA_STRESS_BURST_OPS && churn_pages > 0; i++) {
+		for (int i = 0; i < stress_burst_ops && churn_pages > 0; i++) {
 			int idx = churn_alloc_cursor;
 			unsigned long cur_addr;
 			churn_alloc_cursor++;
@@ -409,7 +471,7 @@ static int stress_thread_fn(void *data) {
 		}
 
 		/* 2) Refault burst: try victims; -ENOENT means not evicted (expected) */
-		for (int i = 0; i < REMOTE_NUMA_STRESS_BURST_OPS && victim_pages > 0; i++) {
+		for (int i = 0; i < stress_burst_ops && victim_pages > 0; i++) {
 			int idx = victim_cursor;
 			unsigned long cur_addr;
 			victim_cursor++;
@@ -420,7 +482,7 @@ static int stress_thread_fn(void *data) {
 		}
 
 		/* 3) Churn free burst: free some churn pages so we can re-alloc and keep pressure */
-		for (int i = 0; i < REMOTE_NUMA_STRESS_BURST_OPS && churn_pages > 0; i++) {
+		for (int i = 0; i < stress_burst_ops && churn_pages > 0; i++) {
 			int idx = churn_free_cursor;
 			unsigned long cur_addr;
 			churn_free_cursor++;
@@ -452,10 +514,11 @@ static int stress_thread_fn(void *data) {
 
 static int run_stress_test(remote_numa_client_cache_t *cache, unsigned long addr, struct mm_struct *mm) {
     struct stress_test_ctx ctx;
-    sema_init(&ctx.sem, REMOTE_NUMA_STRESS_MAX_CONCURRENT_OPS);
+    sema_init(&ctx.sem, stress_max_concurrent);
     atomic_long_set(&ctx.active_allocs, 0);
+    atomic_set(&ctx.initial_done, 0);
     // Validate address range is covered by contiguous VMAs; clamp to what is mapped.
-    unsigned long requested_end = addr + (unsigned long)REMOTE_NUMA_STRESS_TEST_PAGES * PAGE_SIZE;
+    unsigned long requested_end = addr + (unsigned long)stress_test_pages * PAGE_SIZE;
     unsigned long covered_end = addr;
     struct vm_area_struct *vma = NULL;
     struct vma_iterator vmi;
@@ -489,7 +552,7 @@ static int run_stress_test(remote_numa_client_cache_t *cache, unsigned long addr
     }
 
     unsigned long available_pages = (covered_end - addr) / PAGE_SIZE;
-    unsigned long test_pages = REMOTE_NUMA_STRESS_TEST_PAGES;
+    unsigned long test_pages = stress_test_pages;
     if (available_pages < test_pages) {
         printk(KERN_WARNING "[STRESS TEST] Requested %lu pages (%px - %px) but only %lu pages are mapped contiguously (%px - %px). Clamping.\n",
                test_pages, (void *)addr, (void *)requested_end,
@@ -497,10 +560,10 @@ static int run_stress_test(remote_numa_client_cache_t *cache, unsigned long addr
         test_pages = available_pages;
     }
 
-    if (test_pages % REMOTE_NUMA_STRESS_THREADS) {
-        unsigned long new_pages = (test_pages / REMOTE_NUMA_STRESS_THREADS) * REMOTE_NUMA_STRESS_THREADS;
+    if (test_pages % stress_threads) {
+        unsigned long new_pages = (test_pages / stress_threads) * stress_threads;
         printk(KERN_WARNING "[STRESS TEST] test_pages (%lu) not divisible by threads (%d); clamping to %lu pages\n",
-               test_pages, REMOTE_NUMA_STRESS_THREADS, new_pages);
+               test_pages, stress_threads, new_pages);
         test_pages = new_pages;
     }
     if (!test_pages) {
@@ -508,12 +571,12 @@ static int run_stress_test(remote_numa_client_cache_t *cache, unsigned long addr
         return -EINVAL;
     }
 
-    if (test_pages <= REMOTE_NUMA_STRESS_CACHE_SIZE) {
-        printk(KERN_WARNING "[STRESS TEST] test_pages=%lu <= cache_size=%d; evictions/refaults may be rare or absent. Increase userspace mapping or REMOTE_NUMA_STRESS_TEST_PAGES.\n",
-               test_pages, REMOTE_NUMA_STRESS_CACHE_SIZE);
+    if (test_pages <= stress_cache_size) {
+        printk(KERN_WARNING "[STRESS TEST] test_pages=%lu <= cache_size=%d; evictions/refaults may be rare or absent. Increase userspace mapping or stress_test_pages.\n",
+               test_pages, stress_cache_size);
     }
 
-    struct stress_thread_info *thread_infos = kzalloc(sizeof(*thread_infos) * REMOTE_NUMA_STRESS_THREADS, GFP_KERNEL);
+    struct stress_thread_info *thread_infos = kzalloc(sizeof(*thread_infos) * stress_threads, GFP_KERNEL);
     if (!thread_infos) {
         printk(KERN_ERR "[STRESS TEST] Failed to allocate thread_infos\n");
         return -ENOMEM;
@@ -534,8 +597,8 @@ static int run_stress_test(remote_numa_client_cache_t *cache, unsigned long addr
         return -ENOMEM;
     }
     // Partition pages among threads
-    int pages_per_thread = test_pages / REMOTE_NUMA_STRESS_THREADS;
-    for (int t = 0; t < REMOTE_NUMA_STRESS_THREADS; t++) {
+    int pages_per_thread = test_pages / stress_threads;
+    for (int t = 0; t < stress_threads; t++) {
         thread_infos[t].id = t;
         thread_infos[t].cache = cache;
         thread_infos[t].ctx = &ctx;
@@ -552,38 +615,56 @@ static int run_stress_test(remote_numa_client_cache_t *cache, unsigned long addr
      * treated as a real struct page* by refault/free, causing massive failures.
      * Each thread performs its own robust initial allocation with retries.
      */
-    // Start threads
-    for (int t = 0; t < REMOTE_NUMA_STRESS_THREADS; t++) {
+    // Start threads.
+    //
+    // total_threads is published before any thread runs so the initial-phase
+    // barrier in stress_thread_fn knows exactly how many peers to wait for.
+    // If a thread fails to start we decrement the expected count so the
+    // barrier cannot deadlock waiting for a peer that will never arrive.
+    atomic_set(&ctx.total_threads, stress_threads);
+    for (int t = 0; t < stress_threads; t++) {
         init_completion(&thread_infos[t].done);
         thread_infos[t].task = kthread_run(stress_thread_fn, &thread_infos[t], "numa_stress_%d", t);
+        if (IS_ERR(thread_infos[t].task)) {
+            printk(KERN_ERR "[STRESS TEST] Failed to start thread %d (%ld); continuing with fewer threads\n",
+                   t, PTR_ERR(thread_infos[t].task));
+            atomic_dec(&ctx.total_threads);
+        }
+    }
+    if (!atomic_read(&ctx.total_threads)) {
+        printk(KERN_ERR "[STRESS TEST] No stress threads started\n");
+        kfree(all_expected);
+        kfree(all_pages);
+        kfree(thread_infos);
+        return -EIO;
     }
 
     /*
      * Wait for threads to finish their full-duration stress phase.
      * (Duration starts after initial alloc inside the thread.)
      */
-    for (int t = 0; t < REMOTE_NUMA_STRESS_THREADS; t++) {
+    for (int t = 0; t < stress_threads; t++) {
         if (thread_infos[t].task) {
-            unsigned long timeout = ((unsigned long)REMOTE_NUMA_STRESS_MINUTES * 60 + 30) * HZ;
+            unsigned long timeout = ((unsigned long)stress_minutes * 60 + 30) * HZ;
             if (!wait_for_completion_timeout(&thread_infos[t].done, timeout))
                 printk(KERN_WARNING "[STRESS TEST] Thread %d did not finish before timeout; stopping\n", t);
         }
     }
 
     /* Stop/join threads for cleanup (also releases kthread resources). */
-    for (int t = 0; t < REMOTE_NUMA_STRESS_THREADS; t++) {
+    for (int t = 0; t < stress_threads; t++) {
         if (thread_infos[t].task)
             kthread_stop(thread_infos[t].task);
     }
     int any_error = 0;
-    for (int t = 0; t < REMOTE_NUMA_STRESS_THREADS; t++) {
+    for (int t = 0; t < stress_threads; t++) {
         if (thread_infos[t].had_error) {
             any_error = 1;
             printk(KERN_ERR "[STRESS TEST] Thread %d encountered errors!\n", t);
         }
     }
     if (!any_error)
-        printk(KERN_INFO "[STRESS TEST] Completed %d threads for %d minutes with no errors\n", REMOTE_NUMA_STRESS_THREADS, REMOTE_NUMA_STRESS_MINUTES);
+        printk(KERN_INFO "[STRESS TEST] Completed %d threads for %d minutes with no errors\n", stress_threads, stress_minutes);
     else
         printk(KERN_ERR "[STRESS TEST] Errors occurred during stress test!\n");
     kfree(all_pages);

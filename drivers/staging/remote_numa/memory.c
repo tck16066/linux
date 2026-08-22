@@ -185,19 +185,21 @@ int remote_numa_mem_lookup_page(struct remote_numa_mem_mgr *mgr,
 	u32 h = cookie_hash(cookie);
 	struct hlist_head *head = &mgr->cookie_table[h];
 	remote_numa_page_t *pg;
-	
-	unsigned long flags;
-	spin_lock_irqsave(&mgr->lock, flags);
 
+	/*
+	 * cookie_table is built once at init and its hnode links are never
+	 * modified afterwards (pages are only moved on the free_list, which is
+	 * a separate structure guarded by mgr->lock). The fields read here
+	 * (donor_pg_cookie, addr) are set at init and immutable, so this
+	 * pure lookup needs no lock.
+	 */
 	hlist_for_each_entry(pg, head, hnode) {
 		if (pg->donor_pg_cookie == cookie) {
-		spin_unlock_irqrestore(&mgr->lock, flags);
 			*page_out = pg->addr;
 			*rn_pg_out = pg;
 			return 0;
 		}
 	}
-	spin_unlock_irqrestore(&mgr->lock, flags);
 	return -ENOENT;
 }
 
